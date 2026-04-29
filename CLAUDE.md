@@ -750,7 +750,7 @@ phase_1_zerotier:                     complete       # VM_A1 .50 (node 785fd1806
 phase_2_vm_a1_siem_core:              complete       # ES 8.19.14 (4G heap, single-node, soc-core), Kibana 8.19.14, Logstash 8.19.14 (beats:5044, syslog:5140 → ES), Elastic Agent + Fleet Server 8.19.14 on :8220 enrolled in fleet-server-policy. ufw active with allow from 192.168.1.0/24. SOC-Core OS is Ubuntu 26.04 LTS (matches VM_B1, plan said 22.04).
 phase_3_vm_a1_soar_and_ai:            pending
 phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive + Cortex (custom soc-cortex:4.0.1-analyzers image, process mode) + MISP all running; 4 MISP feeds enabled with 6h cron; 4 Cortex analyzers verified end-to-end; ufw active with ZT-only allow rules
-phase_5_vm_b2_victim_lab:             in_progress    # Apache+PHP8.5+MariaDB up; DVWA at /dvwa (admin/password, default security 'low'); vsftpd:21 + ssh:22 (socket-activated) + 3 weak users (testuser1/password123, testuser2/admin, webadmin/webadmin); Suricata 8.0.3 on ztdiyzommr with 49911 ET Open rules + daily refresh cron; Apache extended log format 'soc' at access_soc.log. DEFERRED until VM_A1 ready: Elastic Agent enrollment, MITRE Tagger /scan/suricata in cron, MITRE Tagger /refresh from classification.config
+phase_5_vm_b2_victim_lab:             in_progress    # Apache+PHP8.5+MariaDB up; DVWA at /dvwa (admin/password, default security 'low'); vsftpd:21 + ssh:22 (socket-activated) + 3 weak users (testuser1/password123, testuser2/admin, webadmin/webadmin); Suricata 8.0.3 on ztdiyzommr with 49911 ET Open rules + daily refresh cron; Apache extended log format 'soc' at access_soc.log; Elastic Agent 8.19.14 enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45), HEALTHY. PENDING: integrations to be attached on VM_A1 Kibana (System, Apache HTTP Server → access_soc.log+error.log, Custom Logs → eve.json+vsftpd.log). DEFERRED until VM_A1 phase 3: MITRE Tagger /scan/suricata in cron, /refresh from classification.config
 phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
 phase_7_detection_layer_activation:   pending
 phase_8_soar_integration:             pending
@@ -759,7 +759,7 @@ phase_10_testing:                     pending
 phase_11_documentation:               pending
 
 last_updated: 2026-04-29
-updated_by: soc-core (VM_A1)
+updated_by: victim-lab (VM_B2)
 ```
 
 ---
@@ -770,6 +770,28 @@ updated_by: soc-core (VM_A1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-04-29 — victim-lab (VM_B2) — Phase 5 partial: Elastic Agent enrolled
+  Done:
+    - Downloaded elastic-agent 8.19.14 tarball (matches VM_A1 stack version), installed via
+      `./elastic-agent install --url=https://192.168.1.50:8220 --enrollment-token=<...>
+       --insecure --non-interactive`. Tarball install method matches VM_A1's; clean self-enroll.
+    - Agent ID: c328f63a-4d33-437b-9cc1-cdfbb060df45, enrolled in victim-lab policy
+      (id c226ca2c-fcd2-40c8-9ca6-11392fc7e24e). systemd unit elastic-agent.service active+enabled.
+    - `elastic-agent status` reports HEALTHY / Connected to Fleet immediately after enroll.
+    - Configs snapshotted at ~/soc-project/elastic-agent/ (elastic-agent.yml + INSTALL-NOTES.md).
+      No secrets in either; install token is rotatable and not recorded.
+  Pending:
+    - VM_A1 must attach integrations to victim-lab policy in Kibana → Fleet → Add integration:
+        System (host metrics + auth.log)
+        Apache HTTP Server → /var/log/apache2/access_soc.log (extended `soc` format) + error.log
+        Custom Logs → /var/log/suricata/eve.json (decode_json_fields), /var/log/vsftpd.log
+    - MITRE Tagger /scan/suricata cron append + /refresh from classification.config still gated
+      on VM_A1 Phase 3 (Flask APIs not up yet).
+  Things to know:
+    - Agent's local config at /opt/Elastic/Agent/elastic-agent.yml is just `fleet: enabled: true`.
+      Real policy is delivered from Fleet — all integration tuning happens centrally.
+    - 447 MB tarball was placed in /tmp during install; cleaned up post-enroll.
+
 2026-04-29 — soc-core (VM_A1) — Phase 2 complete: SIEM core (ES + Kibana + Logstash + Fleet Server)
   Done:
     - All four services on Elastic 8.19.14, single-node mode, security/TLS enabled, http.host: 0.0.0.0
