@@ -67,7 +67,7 @@ Project files (configs, code) created during the work stay in `~/soc-project/` o
 | LLM backend | Ollama with `llama3.1:8b` (local, free) |
 | Total external cost | Zero |
 | Shared Git repo | https://github.com/YOUR_USERNAME/soc-shared (CLAUDE.md + docs only) |
-| ZeroTier network ID | 743993800ffa3724 |
+| ZeroTier network ID | cf719fd54008e4d1 |
 
 **Core principle:** Every component is open source or free tier. No API keys with billing. No paid subscriptions. The architecture supports drop-in upgrades to paid tiers later but the PFE deployment runs at zero ongoing cost.
 
@@ -725,7 +725,7 @@ Since project files aren't on Git, back them up locally:
 
 ```yaml
 phase_0_git_setup:                    in_progress    # done on VM_A1, VM_B1; pending clone+soc-project on VM_B2, VM_A2
-phase_1_zerotier:                     pending
+phase_1_zerotier:                     in_progress    # VM_A1 joined+authorized at 192.168.1.50; VM_B1 reachable at 192.168.1.51 (presumed already on the network); pending VM_B2, VM_A2
 phase_2_vm_a1_siem_core:              pending
 phase_3_vm_a1_soar_and_ai:            pending
 phase_4_vm_b1_incident_mgmt:          pending
@@ -738,7 +738,7 @@ phase_10_testing:                     pending
 phase_11_documentation:               pending
 
 last_updated: 2026-04-29
-updated_by: incident-mgmt (VM_B1)
+updated_by: soc-core (VM_A1)
 ```
 
 ---
@@ -749,34 +749,39 @@ updated_by: incident-mgmt (VM_B1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
-2026-04-29 — incident-mgmt (VM_B1)
+2026-04-29 — soc-core (VM_A1) — Phase 1 progress
+  Done since last entry:
+    - ZeroTier network ID changed from 743993800ffa3724 to cf719fd54008e4d1 (user re-created the network); updated in CLAUDE.md and PROJECT-MASTER-PLAN.md
+    - VM_A1 joined cf719fd54008e4d1 (network name "my-first-network")
+    - User authorized the node in admin console; status OK, IP 192.168.1.50/24 live on interface ztdiyzommr
+    - VM_A1 ZeroTier node ID: 785fd1806c (reference for re-authorizing if needed)
+    - Note: VM_B1 already reports IP 192.168.1.51 in its last session note, so VM_B1 likely needs to re-join the new network ID cf719fd54008e4d1 if it was on the old one. Verify with `sudo zerotier-cli listnetworks` on VM_B1.
+  Pending for next instance:
+    - VM_B1: confirm it's on cf719fd54008e4d1 (not the old 743993800ffa3724); rejoin if needed
+    - VM_B2 / VM_A2: Phase 0 (clone+soc-project) AND Phase 1 (install zerotier-one, join cf719fd54008e4d1, await user auth + IP .53/.52)
+    - Verify cross-VM ping once all four are up before flipping phase_1 to complete
+  Notes:
+    - Sudo password is in local memory; user must restate it per session for the harness to accept it (auto-pipe was blocked)
+    - Plugin marketplace install (everything-claude-code) was started in background but is still cloning at last check — separate side task, not part of phase 1
+
+2026-04-29 — incident-mgmt (VM_B1) — Phase 0 clone
   Done:
     - Installed git via apt (was missing on this VM)
     - Cloned soc-shared to ~/soc-shared/ (initially landed in ~/pfe/, then moved to canonical ~/ location)
     - Created empty ~/soc-project/ (local-only working folder)
     - Verified `cd ~/soc-shared && git pull` returns "Already up to date."
     - Confirmed VM identity: hostname=incident-mgmt, ZeroTier IP=192.168.1.51 (interface ztdiyzommr)
-  Pending for next instance on VM_B2 (victim-lab) and VM_A2 (kali-attacker):
-    - git clone https://github.com/kchaouhabib/soc-shared.git ~/soc-shared
-    - mkdir ~/soc-project
-    - Verify: cd ~/soc-shared && git pull   (should report "Already up to date.")
-    - Then phase_0_git_setup flips to "complete"
   Notes:
     - On VM_B1 the user prefers the canonical ~/soc-shared/ path over working out of ~/pfe/. Resolved the open question from the previous note.
     - No project work started yet on this VM — Phase 4 (Cassandra+ES+TheHive+Cortex+MISP) is still pending.
 
-2026-04-29 — soc-core (VM_A1)
+2026-04-29 — soc-core (VM_A1) — Phase 0 bootstrap
   Done:
     - Created GitHub repo https://github.com/kchaouhabib/soc-shared (public)
     - Bootstrapped ~/soc-shared/ with CLAUDE.md, PROJECT-MASTER-PLAN.md, README.md, docs/.gitkeep
     - Initial commit 7429194 pushed to origin/main
     - Created empty ~/soc-project/ (local-only working folder, not on Git)
     - Git identity already configured globally (Habib Kchaou / kchaou.habib67@gmail.com)
-  Pending for next instance on each remaining VM (VM_B1, VM_B2, VM_A2):
-    - git clone https://github.com/kchaouhabib/soc-shared.git ~/soc-shared
-    - mkdir ~/soc-project
-    - Verify: cd ~/soc-shared && git pull   (should report "Already up to date.")
-    - Then phase_0_git_setup flips to "complete"
   Notes:
     - Source markdown files were copied from /home/vboxuser/pfe/ on VM_A1
     - Keep that pfe/ folder as the editable working location, or delete it now that ~/soc-shared/ is the canonical source — your call

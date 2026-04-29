@@ -79,7 +79,7 @@ The system is built on 4 VMs distributed across 2 physical hosts, connected thro
 
 ```
 ZeroTier overlay network — 192.168.1.0/24
-Network ID: 743993800ffa3724
+Network ID: cf719fd54008e4d1
 
   PC_A                              PC_B
   ┌─────────────────────┐           ┌─────────────────────────────────────┐
@@ -217,7 +217,7 @@ Sub-steps:
 
 Sub-steps:
 - Install ZeroTier on each VM
-- Join network ID `743993800ffa3724`
+- Join network ID `cf719fd54008e4d1`
 - Authorize each member on the ZeroTier admin console
 - Assign each VM its planned IP (.50, .51, .52, .53)
 - Verify cross-VM reachability with ping
