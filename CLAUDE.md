@@ -551,7 +551,8 @@ fleet_server:
   url: https://192.168.1.50:8220       # self-signed cert; agents enroll with --insecure
   service_token: see ~/soc-project/.env.local on VM_A1 (FLEET_SERVER_SERVICE_TOKEN)
   fleet_server_policy_id: fleet-server-policy
-  enrollment_token_victim_lab: generate on demand via Kibana UI / Fleet API
+  victim_lab_policy_id: c226ca2c-fcd2-40c8-9ca6-11392fc7e24e   # "victim-lab policy" — System integration + monitoring
+  enrollment_token_victim_lab: generate via Fleet API (policy-bound, rotatable). See "Agent enrollment" below.
   enrollment_token_attacker: descoped (VM_A2 out of scope)
 
 n8n:
@@ -568,6 +569,24 @@ flask_apis:
   correlation:   http://192.168.1.50:5002
   mitre_tagger:  http://192.168.1.50:5003
 ```
+
+**Agent enrollment — generate a fresh victim-lab token (run on VM_A1):**
+```bash
+curl -s -u elastic:$ELASTIC_PASSWORD -H "kbn-xsrf: soc" -H "Content-Type: application/json" \
+  -X POST "http://localhost:5601/api/fleet/enrollment_api_keys" \
+  -d '{"policy_id":"c226ca2c-fcd2-40c8-9ca6-11392fc7e24e","name":"victim-lab-key-'"$(date +%s)"'"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['item']['api_key'])"
+```
+
+**Then on VM_B2 (or any agent host) — install command template:**
+```bash
+sudo ./elastic-agent install \
+  --url=https://192.168.1.50:8220 \
+  --enrollment-token=<token from above> \
+  --insecure \
+  --non-interactive
+```
+After enrollment, add **Apache HTTP Server**, **Custom Logs** (eve.json, access_soc.log, vsftpd.log) integrations to the policy via Kibana → Fleet → victim-lab policy → Add integration.
 
 ### VM_B1 — incident-mgmt
 
