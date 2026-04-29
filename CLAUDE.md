@@ -728,7 +728,7 @@ phase_0_git_setup:                    complete       # VM_A1, VM_B1, VM_B2 done;
 phase_1_zerotier:                     complete       # VM_A1 .50 (node 785fd1806c), VM_B1 .51 (node 9ab369cb6c), VM_B2 .53 (node aa429ed844) all reachable; VM_A2 descoped
 phase_2_vm_a1_siem_core:              pending
 phase_3_vm_a1_soar_and_ai:            pending
-phase_4_vm_b1_incident_mgmt:          in_progress    # Java 11, Cassandra 4.1.11 (heap 512M, cluster SOC-Cluster), local ES 8.19.14 (heap 1G, cluster thehive-cortex-cluster), Docker 29.4.1+compose v5, TheHive 5.7.1 + Cortex 4.0.1 (containers, network=host) all running; TheHive↔Cortex wired via API key; MISP install + feeds + Cortex analyzers + ufw still pending
+phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive + Cortex (custom soc-cortex:4.0.1-analyzers image, process mode) + MISP all running; 4 MISP feeds enabled with 6h cron; 4 Cortex analyzers verified end-to-end; ufw active with ZT-only allow rules
 phase_5_vm_b2_victim_lab:             in_progress    # Apache+PHP8.5+MariaDB up; DVWA at /dvwa (admin/password, default security 'low'); vsftpd:21 + ssh:22 (socket-activated) + 3 weak users (testuser1/password123, testuser2/admin, webadmin/webadmin); Suricata 8.0.3 on ztdiyzommr with 49911 ET Open rules + daily refresh cron; Apache extended log format 'soc' at access_soc.log. DEFERRED until VM_A1 ready: Elastic Agent enrollment, MITRE Tagger /scan/suricata in cron, MITRE Tagger /refresh from classification.config
 phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
 phase_7_detection_layer_activation:   pending
@@ -749,6 +749,77 @@ updated_by: victim-lab (VM_B2)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-04-29 — incident-mgmt (VM_B1) — Phase 4 complete: MISP + analyzers + UFW
+  Architectural deviations from the plan (defendable for the rapport):
+    - Cortex analyzers — built a custom image soc-cortex:4.0.1-analyzers (Dockerfile in
+      ~/soc-project/thehive-cortex/cortex/Dockerfile) extending thehiveproject/cortex:4.0.1.
+      Reason: docker-mode (mounting /var/run/docker.sock) is unsafe — the upstream cortex
+      entrypoint runs `chown 1001:1001 /var/run/docker.sock` and that bind-mount mutates the
+      HOST socket's ownership, locking vboxuser out of docker. Process mode + on-disk
+      Cortex-Analyzers (cloned at build time) is the durable fix. Image bakes in cortexutils,
+      pymisp, OTXv2, vt-py, python-magic, libmagic1.
+    - MISP port binding — bound 192.168.1.51:8080 / 192.168.1.51:8443 only, not 0.0.0.0.
+      UFW INPUT rules don't filter docker-published ports (FORWARD chain), so we restrict
+      the listener at the source. Compose vars in ~/soc-project/misp/.env: CORE_HTTP_PORT
+      and CORE_HTTPS_PORT have an IP prefix.
+    - AlienVault OTX — integrated as a Cortex analyzer (OTXQuery_2_0), NOT as a MISP feed.
+      MISP's bundled defaults don't include OTX, and the OTX→MISP bridge would be a
+      cron-driven pull script. Cortex analyzer gives on-demand enrichment which is more
+      useful for the SOC pipeline anyway. Document the choice in the rapport.
+    - Cortex CSRF gotcha — Cortex 4.0.1 uses a custom header `X-CORTEX-XSRF-TOKEN` for
+      session-auth writes (cookie name is `CORTEX-XSRF-TOKEN`). Bearer token auth bypasses
+      CSRF. Documented because session auth attempts kept hitting "No CSRF token found".
+  Done:
+    - MISP Docker stack at https://192.168.1.51:8443 (5 containers: misp-core, misp-modules,
+      db (mariadb 10.11), redis (valkey 7.2), mail). First boot needed `up -d` twice — modules
+      health check window is shorter than its actual readiness. Documented in known-issues
+      already; matches expectation.
+    - MISP admin API key generated via UI; saved to ~/soc-project/.env.local as MISP_API_KEY.
+    - MISP feeds: loaded all 96 bundled defaults via /feeds/loadDefaultFeeds, then enabled
+      caching+fetch on:
+        id=1  CIRCL OSINT Feed
+        id=4  ET Compromised IPs (rules.emergingthreats.net)
+        id=12 Feodo IP Blocklist
+        id=65 Abuse.ch URLhaus
+      Initial fetch queued via /feeds/fetchFromAllFeeds.
+    - MISP feed auto-fetch cron — host crontab on VM_B1 (vboxuser):
+        `0 */6 * * * /home/vboxuser/soc-project/misp/cron-feeds.sh`
+      Script docker-execs `cake Server fetchFeed/cacheFeed all` and rotates its own log.
+      Used host cron (not in-DB MISP scheduler) because the misp-core image doesn't run
+      the `scheduler` background worker — only default/email/cache/prio/update.
+    - Cortex analyzer instances (all 4 verified live, end-to-end):
+        AbuseIPDB (id=6b1c…) on 8.8.8.8 → safe; on 185.220.101.1 → 100/malicious, Tor=True
+        OTXQuery (id=eb54…)  on 8.8.8.8 → 0 pulses
+        VirusTotal_GetReport (id=8cac…) on WannaCry SHA256 → 69/75 malicious
+        MISP (id=b20c…) wired to https://192.168.1.51:8443 (cert_check=false), tested OK
+      cortex-user roles: read,analyze,**orgadmin** (added so the same key can configure
+      analyzer instances + run them — saves a second key for TheHive).
+    - Superadmin API key generated and saved (CORTEX_SUPERADMIN_API_KEY in .env.local).
+    - UFW active. Default deny-in / allow-out / deny-routed.
+        9000 (TheHive), 9001 (Cortex), 8080+8443 (MISP), 22 (SSH future-proof) — ALLOW from
+        192.168.1.0/24 only. 9993/udp (ZeroTier control) ALLOW from anywhere. 9042/9200
+        kept localhost-only by service config (no UFW rule needed).
+    - Earlier 192.168.1.60 connection — confirmed by user, that's their host machine on the
+      ZT network. No rogue actor. Reachability from .60 is via the new UFW rules.
+  Files added on this VM (not committed; live in ~/soc-project/):
+    - thehive-cortex/cortex/Dockerfile             custom cortex image
+    - thehive-cortex/cortex/Cortex-Analyzers/      cloned shallow from GitHub (191MB)
+    - thehive-cortex/docker-compose.yml            updated: build.network=host, soc-cortex tag
+    - misp/cron-feeds.sh                           feed fetch + cache, log rotation
+    - misp/.env                                    CORE_HTTP/HTTPS_PORT prefixed with ZT IP
+    - .env.local                                   added MISP_API_KEY, OTX/ABUSEIPDB/VT keys,
+                                                   CORTEX_SUPERADMIN_API_KEY, SUDO_PASS
+  Memory snapshot at end of phase 4: ~7.7G used / 9.0G total. Tight but stable. The bulk is
+    Cortex JVM, ES JVM, TheHive JVM, MISP PHP-FPM. No swap available — don't add a desktop GUI.
+  Things to know for next session:
+    - On reboot, the docker compose files come up on their own (restart: unless-stopped).
+      Cassandra/ES are systemd services. Crontab survives reboot.
+    - The CSRF header name `X-CORTEX-XSRF-TOKEN` — write this down. If you ever need to
+      script user/org admin via session auth, that's the gotcha.
+    - cortex-user's API key is the do-everything key on this VM (orgadmin in SOC-LAB +
+      analyze + read). TheHive uses it via TH_CORTEX_KEYS env var.
+    - 192.168.1.60 is user's host (ZT-joined) — expected source for browser access.
+
 2026-04-29 — victim-lab (VM_B2) — Phase 5 (vulnerable target + IDS, Elastic Agent deferred)
   Done:
     - Apache 2 + PHP 8.5 + libapache2-mod-php + php-mysqli/gd/xml/cli installed (Ubuntu 25.10 ships PHP 8.5, newer than the master plan's 8.x assumption — DVWA still works, just emits deprecation warnings that we silence with display_errors=Off)
