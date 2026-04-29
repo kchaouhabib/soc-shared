@@ -162,7 +162,7 @@ NLP description, MITRE tags, ML score, Cortex enrichment, response status
 ## VM profiles
 
 ### VM_A1 — soc-core
-**Hostname:** `soc-core` | **IP:** `192.168.1.50` | **Host:** PC_A | **OS:** Ubuntu Server 22.04 LTS
+**Hostname:** `SOC-Core` | **IP:** `192.168.1.50` | **Host:** PC_A | **OS:** Ubuntu 26.04 LTS (Resolute Raccoon)
 
 **Role:** SIEM core + SOAR + AI services
 
@@ -537,20 +537,22 @@ Classtype map cached at `/opt/mitre-tagger/classtype_map.json` (rebuilds when `c
 
 ```yaml
 elasticsearch:
-  url: http://192.168.1.50:9200
+  url: https://192.168.1.50:9200       # TLS, self-signed cert
   user: elastic
-  password: FILL_AFTER_SETUP
+  password: see ~/soc-project/.env.local on VM_A1 (ELASTIC_PASSWORD)
+  ca_fingerprint: 3c05387e1bd8f68441f718f08611bcc7d7d22d02e3be8901beeced45976965d4
 
 kibana:
-  url: http://192.168.1.50:5601
+  url: http://192.168.1.50:5601        # plain HTTP, lab; auth via elastic user
   user: elastic
-  password: FILL_AFTER_SETUP
+  password: same as elasticsearch (ELASTIC_PASSWORD)
 
 fleet_server:
-  url: http://192.168.1.50:8220
-  service_token: FILL_AFTER_SETUP
-  enrollment_token_victim_lab: FILL_AFTER_SETUP
-  enrollment_token_attacker: FILL_AFTER_SETUP
+  url: https://192.168.1.50:8220       # self-signed cert; agents enroll with --insecure
+  service_token: see ~/soc-project/.env.local on VM_A1 (FLEET_SERVER_SERVICE_TOKEN)
+  fleet_server_policy_id: fleet-server-policy
+  enrollment_token_victim_lab: generate on demand via Kibana UI / Fleet API
+  enrollment_token_attacker: descoped (VM_A2 out of scope)
 
 n8n:
   url: http://192.168.1.50:5678
@@ -726,7 +728,7 @@ Since project files aren't on Git, back them up locally:
 ```yaml
 phase_0_git_setup:                    complete       # VM_A1, VM_B1, VM_B2 done; VM_A2 descoped (see notes 2026-04-29)
 phase_1_zerotier:                     complete       # VM_A1 .50 (node 785fd1806c), VM_B1 .51 (node 9ab369cb6c), VM_B2 .53 (node aa429ed844) all reachable; VM_A2 descoped
-phase_2_vm_a1_siem_core:              pending
+phase_2_vm_a1_siem_core:              complete       # ES 8.19.14 (4G heap, single-node, soc-core), Kibana 8.19.14, Logstash 8.19.14 (beats:5044, syslog:5140 → ES), Elastic Agent + Fleet Server 8.19.14 on :8220 enrolled in fleet-server-policy. ufw active with allow from 192.168.1.0/24. SOC-Core OS is Ubuntu 26.04 LTS (matches VM_B1, plan said 22.04).
 phase_3_vm_a1_soar_and_ai:            pending
 phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive + Cortex (custom soc-cortex:4.0.1-analyzers image, process mode) + MISP all running; 4 MISP feeds enabled with 6h cron; 4 Cortex analyzers verified end-to-end; ufw active with ZT-only allow rules
 phase_5_vm_b2_victim_lab:             in_progress    # Apache+PHP8.5+MariaDB up; DVWA at /dvwa (admin/password, default security 'low'); vsftpd:21 + ssh:22 (socket-activated) + 3 weak users (testuser1/password123, testuser2/admin, webadmin/webadmin); Suricata 8.0.3 on ztdiyzommr with 49911 ET Open rules + daily refresh cron; Apache extended log format 'soc' at access_soc.log. DEFERRED until VM_A1 ready: Elastic Agent enrollment, MITRE Tagger /scan/suricata in cron, MITRE Tagger /refresh from classification.config
@@ -738,7 +740,7 @@ phase_10_testing:                     pending
 phase_11_documentation:               pending
 
 last_updated: 2026-04-29
-updated_by: victim-lab (VM_B2)
+updated_by: soc-core (VM_A1)
 ```
 
 ---
@@ -749,6 +751,28 @@ updated_by: victim-lab (VM_B2)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-04-29 — soc-core (VM_A1) — Phase 2 complete: SIEM core (ES + Kibana + Logstash + Fleet Server)
+  Done:
+    - All four services on Elastic 8.19.14, single-node mode, security/TLS enabled, http.host: 0.0.0.0
+    - Elasticsearch: cluster.name=soc-core, node.name=soc-core, 4 GB heap (Xms=Xmx=4g), green, reachable at https://192.168.1.50:9200
+    - Kibana: server.host: 0.0.0.0, server.publicBaseUrl: http://192.168.1.50:5601, available, reachable at http://192.168.1.50:5601 (HTTP, no TLS — lab)
+    - Logstash: pipeline /etc/logstash/conf.d/soc-pipeline.conf with inputs beats:5044 + syslog:5140 → output ES https://192.168.1.50:9200 (ssl_verification_mode=none for lab self-signed). ELASTIC_PASSWORD passed via systemd drop-in /etc/systemd/system/logstash.service.d/override.conf (mode 600). Tried logstash-keystore first; the JRuby `create` step hung indefinitely on this slow VM, so switched to systemd Environment.
+    - Elastic Agent + Fleet Server: installed via tarball (deb path doesn't expose --fleet-server flags), self-enrolled into agent policy id `fleet-server-policy` (created via Fleet API with has_fleet_server=true; auto-added fleet_server@1.6.0 package). Listens on :8220 with self-signed cert (--insecure). Fleet Server service token is in ~/soc-project/.env.local as FLEET_SERVER_SERVICE_TOKEN.
+    - ufw active: default deny incoming, allow ssh from anywhere, allow ALL traffic from 192.168.1.0/24. SSH session stayed alive through `ufw enable` (conntrack OK).
+    - Configs snapshotted to ~/soc-project/{elasticsearch,kibana,logstash,fleet}/ (local-only)
+  Architectural notes for the rapport:
+    - VM_A1 OS is Ubuntu 26.04 LTS (resolute), not the planned 22.04 — matches VM_B1. Elastic 8.x debs are codename-agnostic so no impact.
+    - Initial Fleet Server install attempt failed with "Waiting on default policy with Fleet Server integration" — root cause: POST /api/fleet/setup creates the service account but does NOT pre-create policies; the agent's auto-default-policy probing didn't add the fleet_server integration. Fix: explicit POST /api/fleet/agent_policies with has_fleet_server=true, then pass --fleet-server-policy=fleet-server-policy. Documented in ~/soc-project/fleet/install-notes.md.
+    - Network bottleneck on this VM: Wi-Fi-bridged virtio-net averages ~80–100 KB/s for Elastic CDN downloads. Each large package took ~1h. Phase 2 took several wall-clock hours mostly waiting on apt.
+  This unblocks VM_B2:
+    - VM_B2 can now enroll its Elastic Agent. Use Kibana UI Fleet → Add Agent → pick the default Agent policy (NOT fleet-server-policy), copy the install command. Or generate enrollment token via:
+        curl -s -u elastic:$ELASTIC_PASSWORD -H "kbn-xsrf: soc" -X POST http://localhost:5601/api/fleet/enrollment_api_keys -d '{"policy_id":"<agent-policy-id>"}'
+      Fleet Server URL for agents: https://192.168.1.50:8220 (self-signed → use --insecure)
+    - VM_B2 should add Fleet integrations: System, Apache HTTP Server, Custom Logs (eve.json, access_soc.log, vsftpd.log)
+  Pending on this VM (Phase 3):
+    - n8n, Ollama (llama3.1:8b ~5 GB), 4 Flask APIs (ML, NLP, Correlation, MITRE Tagger). Big disk + RAM step — confirm before starting.
+  Real credentials live in ~/soc-project/.env.local (mode 600). CLAUDE.md only references placeholders.
+
 2026-04-29 — incident-mgmt (VM_B1) — Phase 4 complete: MISP + analyzers + UFW
   Architectural deviations from the plan (defendable for the rapport):
     - Cortex analyzers — built a custom image soc-cortex:4.0.1-analyzers (Dockerfile in
@@ -893,66 +917,7 @@ updated_by: victim-lab (VM_B2)
   - Rationale: attack simulations (Phase 6 / parts of Phase 10) can be launched from any reachable host.
   - Effect: Phase 6 marked descoped; phase_0 / phase_1 flipped to complete despite VM_A2 not catching up.
 
-2026-04-29 — victim-lab (VM_B2) — Phase 0 + Phase 1 (with VM_B1 collateral)
-  Done:
-    - This VM was cloned from VM_B1, so it inherited VM_B1's ZeroTier identity (shared node 9ab369cb6c, both presenting IP 192.168.1.51)
-    - Purged zerotier-one + wiped /var/lib/zerotier-one/ → reinstalled → fresh node aa429ed844
-    - Joined cf719fd54008e4d1; Central authorized aa429ed844 with IP 192.168.1.53
-    - Hostname myguest → victim-lab (hostnamectl + 127.0.1.1 in /etc/hosts)
-    - Cloned soc-shared to /home/vboxuser/soc-shared (after first landing in ~/pfe/, then moved); created /home/vboxuser/soc-project/
-    - Switched git remote to SSH (git@github.com:kchaouhabib/soc-shared.git); SSH key on this VM: ~/.ssh/id_ed25519 (pubkey added to user's GitHub account, titled "victim-lab (VM_B2)")
-  VM_B1 status:
-    - User confirmed VM_B1's real ZT node ID is also 9ab369cb6c (same as the clone's, which was VM_B1's identity all along — this VM was the copy, not the original).
-    - VM_B1 stayed authorized and reachable; ping from VM_B2 to 192.168.1.51 returns 0% loss (~7ms, direct P2P on same host).
-    - No collateral damage from the deauth/rejoin dance — VM_B1 is fine.
-  Connectivity verified from VM_B2:
-    - 192.168.1.50 (VM_A1) ✅ 0% loss, ~174ms (via ZT root, different physical host)
-    - 192.168.1.51 (VM_B1) ✅ 0% loss, ~7ms (P2P, same host)
-    - 192.168.1.52 (VM_A2) ❌ unreachable (Phase 1 not done on A2 yet)
-  Pending for next instances:
-    - VM_A2: Phase 0 (clone+soc-project) + Phase 1 (install zerotier-one, join cf719fd54008e4d1, request user auth at IP .52)
-    - Then verify all-4 cross-VM ping before flipping phase_1 to complete
-  Notes:
-    - VM_B2 still missing all Phase 5 services (Apache/MariaDB/DVWA/vsftpd/Suricata/Elastic Agent) — fresh install ahead
-    - Reboot recommended before Phase 5 to confirm hostname persists
-    - VM_B2 sudo password is in ~/soc-project/.env.local on the VM (NOT in this file, NOT in Git)
-
-2026-04-29 — soc-core (VM_A1) — Phase 1 progress
-  Done since last entry:
-    - ZeroTier network ID changed from 743993800ffa3724 to cf719fd54008e4d1 (user re-created the network); updated in CLAUDE.md and PROJECT-MASTER-PLAN.md
-    - VM_A1 joined cf719fd54008e4d1 (network name "my-first-network")
-    - User authorized the node in admin console; status OK, IP 192.168.1.50/24 live on interface ztdiyzommr
-    - VM_A1 ZeroTier node ID: 785fd1806c (reference for re-authorizing if needed)
-    - Note: VM_B1 already reports IP 192.168.1.51 in its last session note, so VM_B1 likely needs to re-join the new network ID cf719fd54008e4d1 if it was on the old one. Verify with `sudo zerotier-cli listnetworks` on VM_B1.
-  Pending for next instance:
-    - VM_B1: confirm it's on cf719fd54008e4d1 (not the old 743993800ffa3724); rejoin if needed
-    - VM_B2 / VM_A2: Phase 0 (clone+soc-project) AND Phase 1 (install zerotier-one, join cf719fd54008e4d1, await user auth + IP .53/.52)
-    - Verify cross-VM ping once all four are up before flipping phase_1 to complete
-  Notes:
-    - Sudo password is in local memory; user must restate it per session for the harness to accept it (auto-pipe was blocked)
-    - Plugin marketplace install (everything-claude-code) was started in background but is still cloning at last check — separate side task, not part of phase 1
-
-2026-04-29 — incident-mgmt (VM_B1) — Phase 0 clone
-  Done:
-    - Installed git via apt (was missing on this VM)
-    - Cloned soc-shared to ~/soc-shared/ (initially landed in ~/pfe/, then moved to canonical ~/ location)
-    - Created empty ~/soc-project/ (local-only working folder)
-    - Verified `cd ~/soc-shared && git pull` returns "Already up to date."
-    - Confirmed VM identity: hostname=incident-mgmt, ZeroTier IP=192.168.1.51 (interface ztdiyzommr)
-  Notes:
-    - On VM_B1 the user prefers the canonical ~/soc-shared/ path over working out of ~/pfe/. Resolved the open question from the previous note.
-    - No project work started yet on this VM — Phase 4 (Cassandra+ES+TheHive+Cortex+MISP) is still pending.
-
-2026-04-29 — soc-core (VM_A1) — Phase 0 bootstrap
-  Done:
-    - Created GitHub repo https://github.com/kchaouhabib/soc-shared (public)
-    - Bootstrapped ~/soc-shared/ with CLAUDE.md, PROJECT-MASTER-PLAN.md, README.md, docs/.gitkeep
-    - Initial commit 7429194 pushed to origin/main
-    - Created empty ~/soc-project/ (local-only working folder, not on Git)
-    - Git identity already configured globally (Habib Kchaou / kchaou.habib67@gmail.com)
-  Notes:
-    - Source markdown files were copied from /home/vboxuser/pfe/ on VM_A1
-    - Keep that pfe/ folder as the editable working location, or delete it now that ~/soc-shared/ is the canonical source — your call
+[older entries archived to docs/session-history.md: VM_B2 Phase 0+1, VM_A1 Phase 1 progress, VM_B1 Phase 0 clone, VM_A1 Phase 0 bootstrap]
 ```
 
 ---
