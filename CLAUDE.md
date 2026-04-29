@@ -66,7 +66,7 @@ Project files (configs, code) created during the work stay in `~/soc-project/` o
 | Detection framework | MITRE ATT&CK |
 | LLM backend | Ollama with `llama3.1:8b` (local, free) |
 | Total external cost | Zero |
-| Shared Git repo | https://github.com/YOUR_USERNAME/soc-shared (CLAUDE.md + docs only) |
+| Shared Git repo | https://github.com/kchaouhabib/soc-shared (CLAUDE.md + docs only) |
 | ZeroTier network ID | cf719fd54008e4d1 |
 
 **Core principle:** Every component is open source or free tier. No API keys with billing. No paid subscriptions. The architecture supports drop-in upgrades to paid tiers later but the PFE deployment runs at zero ongoing cost.
@@ -724,8 +724,8 @@ Since project files aren't on Git, back them up locally:
 ## Current state
 
 ```yaml
-phase_0_git_setup:                    in_progress    # done on VM_A1, VM_B1; pending clone+soc-project on VM_B2, VM_A2
-phase_1_zerotier:                     in_progress    # VM_A1 joined+authorized at 192.168.1.50; VM_B1 reachable at 192.168.1.51 (presumed already on the network); pending VM_B2, VM_A2
+phase_0_git_setup:                    in_progress    # done on VM_A1, VM_B1, VM_B2; pending clone+soc-project on VM_A2
+phase_1_zerotier:                     in_progress    # VM_A1 joined+auth at .50; VM_B2 joined+auth at .53 (fresh node aa429ed844); VM_B1 was using cloned identity 9ab369cb6c which got deauthorized — VM_B1 likely offline, must regenerate identity; VM_A2 pending
 phase_2_vm_a1_siem_core:              pending
 phase_3_vm_a1_soar_and_ai:            pending
 phase_4_vm_b1_incident_mgmt:          pending
@@ -738,7 +738,7 @@ phase_10_testing:                     pending
 phase_11_documentation:               pending
 
 last_updated: 2026-04-29
-updated_by: soc-core (VM_A1)
+updated_by: victim-lab (VM_B2)
 ```
 
 ---
@@ -749,6 +749,27 @@ updated_by: soc-core (VM_A1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-04-29 — victim-lab (VM_B2) — Phase 0 + Phase 1 (with VM_B1 collateral)
+  Done:
+    - This VM was cloned from VM_B1, so it inherited VM_B1's ZeroTier identity (shared node 9ab369cb6c, both presenting IP 192.168.1.51)
+    - Purged zerotier-one + wiped /var/lib/zerotier-one/ → reinstalled → fresh node aa429ed844
+    - Joined cf719fd54008e4d1; Central authorized aa429ed844 with IP 192.168.1.53
+    - Hostname myguest → victim-lab (hostnamectl + 127.0.1.1 in /etc/hosts)
+    - Cloned soc-shared to /home/vboxuser/soc-shared (after first landing in ~/pfe/, then moved); created /home/vboxuser/soc-project/
+    - Switched git remote to SSH (git@github.com:kchaouhabib/soc-shared.git); SSH key on this VM: ~/.ssh/id_ed25519 (pubkey added to user's GitHub account, titled "victim-lab (VM_B2)")
+  ⚠️ CRITICAL — VM_B1 collateral damage:
+    - The "old" node 9ab369cb6c we deauthorized in Central was actually shared between VM_B2 (clone) and the REAL VM_B1.
+    - Per the prior VM_B1 session note, VM_B1 was using IP 192.168.1.51 too. Deauthorizing 9ab369cb6c removed BOTH from the network.
+    - Next VM_B1 session MUST: `sudo zerotier-cli info` → if status is REQUESTING_CONFIGURATION or IP missing, regenerate identity the same way we did here (purge zerotier-one, rm -rf /var/lib/zerotier-one, reinstall, join cf719fd54008e4d1, ask user to authorize in Central and re-assign 192.168.1.51).
+  Pending for next instances:
+    - VM_B1: fix ZeroTier per the warning above
+    - VM_A2: Phase 0 (clone+soc-project) + Phase 1 (install zerotier-one, join cf719fd54008e4d1, request user auth at IP .52)
+    - Verify cross-VM ping (4 nodes all up) before flipping phase_1 to complete
+  Notes:
+    - VM_B2 still missing all Phase 5 services (Apache/MariaDB/DVWA/vsftpd/Suricata/Elastic Agent) — fresh install ahead
+    - Reboot recommended before Phase 5 to confirm hostname persists
+    - VM_B2 sudo password is in ~/soc-project/.env.local on the VM (NOT in this file, NOT in Git)
+
 2026-04-29 — soc-core (VM_A1) — Phase 1 progress
   Done since last entry:
     - ZeroTier network ID changed from 743993800ffa3724 to cf719fd54008e4d1 (user re-created the network); updated in CLAUDE.md and PROJECT-MASTER-PLAN.md
