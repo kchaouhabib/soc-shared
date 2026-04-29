@@ -729,7 +729,7 @@ phase_1_zerotier:                     complete       # VM_A1 .50 (node 785fd1806
 phase_2_vm_a1_siem_core:              pending
 phase_3_vm_a1_soar_and_ai:            pending
 phase_4_vm_b1_incident_mgmt:          in_progress    # Java 11, Cassandra 4.1.11 (heap 512M, cluster SOC-Cluster), local ES 8.19.14 (heap 1G, cluster thehive-cortex-cluster), Docker 29.4.1+compose v5, TheHive 5.7.1 + Cortex 4.0.1 (containers, network=host) all running; TheHive↔Cortex wired via API key; MISP install + feeds + Cortex analyzers + ufw still pending
-phase_5_vm_b2_victim_lab:             pending
+phase_5_vm_b2_victim_lab:             in_progress    # Apache+PHP8.5+MariaDB up; DVWA at /dvwa (admin/password, default security 'low'); vsftpd:21 + ssh:22 (socket-activated) + 3 weak users (testuser1/password123, testuser2/admin, webadmin/webadmin); Suricata 8.0.3 on ztdiyzommr with 49911 ET Open rules + daily refresh cron; Apache extended log format 'soc' at access_soc.log. DEFERRED until VM_A1 ready: Elastic Agent enrollment, MITRE Tagger /scan/suricata in cron, MITRE Tagger /refresh from classification.config
 phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
 phase_7_detection_layer_activation:   pending
 phase_8_soar_integration:             pending
@@ -738,7 +738,7 @@ phase_10_testing:                     pending
 phase_11_documentation:               pending
 
 last_updated: 2026-04-29
-updated_by: incident-mgmt (VM_B1)
+updated_by: victim-lab (VM_B2)
 ```
 
 ---
@@ -749,6 +749,29 @@ updated_by: incident-mgmt (VM_B1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-04-29 — victim-lab (VM_B2) — Phase 5 (vulnerable target + IDS, Elastic Agent deferred)
+  Done:
+    - Apache 2 + PHP 8.5 + libapache2-mod-php + php-mysqli/gd/xml/cli installed (Ubuntu 25.10 ships PHP 8.5, newer than the master plan's 8.x assumption — DVWA still works, just emits deprecation warnings that we silence with display_errors=Off)
+    - PHP config patched: allow_url_include=On (enables RFI), display_errors=Off, log_errors=On, allow_url_fopen=On
+    - MariaDB installed; root uses unix_socket auth (no password); created `dvwa` DB + `dvwa@localhost` user with random 24-char password (saved to ~/soc-project/.env.local as DVWA_DB_PASSWORD)
+    - DVWA cloned to /var/www/html/dvwa from github.com/digininja/DVWA; chown www-data; config/ and hackable/uploads/ writable; config.inc.php patched with real DB password; default_security_level flipped from 'impossible' to 'low' (cookie 'security' now defaults low for any new session)
+    - DB tables created via /dvwa/setup.php (users, guestbook, access_log, security_log); admin/password login confirmed
+    - vsftpd installed; anonymous_enable=NO (default), local_enable=YES, write_enable=YES, xferlog_file=/var/log/vsftpd.log; listening on :21
+    - openssh-server installed; uses ssh.socket (socket activation pattern on modern Ubuntu — `systemctl is-active ssh` shows inactive, that's normal); drop-in /etc/ssh/sshd_config.d/99-soc-lab.conf forces PasswordAuthentication yes + PermitRootLogin no
+    - Three weak users created (no sudo): testuser1/password123, testuser2/admin, webadmin/webadmin — verified all 3 can log in via FTP (curl --user → 226)
+    - Suricata 8.0.3 + suricata-update installed; af-packet interface set to ztdiyzommr (NOT enp0s3, which is VirtualBox NAT); HOME_NET already covers 192.168.0.0/16; 49,911 ET Open rules loaded (of 65,786 total, 15k disabled by default); 6 worker threads; eve.json being written; first hit was "ET INFO Spotify P2P Client" (low-sev, ignore)
+    - /etc/cron.d/suricata-update at 03:00 daily — refreshes rules + reloads suricata
+    - Apache extended log: LogFormat 'soc' defined in /etc/apache2/conf-available/soc-logging.conf; CustomLog directive added inside 000-default.conf vhost (LogFormat at server level wasn't enough — vhost CustomLog overrides server-level); writes to /var/log/apache2/access_soc.log with timing(µs), bytes_in/out, query string, referer, UA, X-Forwarded-For; chowned root:adm so the future Elastic Agent can read it
+    - Snapshot of all editable configs copied to ~/soc-project/{apache,mariadb,ssh-and-vsftpd,suricata,dvwa}/
+  DEFERRED — needs VM_A1 first:
+    - Elastic Agent enrollment: needs Fleet Server URL + enrollment token from VM_A1 Phase 2 (Elasticsearch+Kibana+Fleet not deployed yet)
+    - Daily MITRE auto-tag call: append `&& curl -sS -X POST http://192.168.1.50:5003/scan/suricata` to /etc/cron.d/suricata-update once VM_A1 Phase 3 (Flask APIs) is done
+    - MITRE Tagger /refresh after install: trigger once classification.config can be read by the tagger (either copy /etc/suricata/classification.config to A1 or have A1 SSH to read it)
+  Surface for next instance:
+    - VM_B2 services to add to Kibana Fleet integrations once A1 is up: System, Apache HTTP Server (parses access.log combined format natively), Custom Logs for /var/log/suricata/eve.json AND /var/log/apache2/access_soc.log AND /var/log/vsftpd.log
+    - Reboot performed at end of session to verify all services persist (apache2, mariadb, vsftpd, ssh.socket, suricata, zerotier-one all `systemctl enable`d)
+    - VM_B2 sudo password is 'kali' (in ~/soc-project/.env.local, not in this file)
+
 2026-04-29 — incident-mgmt (VM_B1) — Phase 4 partial: Cassandra + ES + TheHive + Cortex
   Architectural deviation from the plan (defendable for the rapport):
     - Master plan called for `apt install thehive` and `apt install cortex` from StrangeBee's APT repo.
