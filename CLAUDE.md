@@ -725,7 +725,7 @@ Since project files aren't on Git, back them up locally:
 
 ```yaml
 phase_0_git_setup:                    in_progress    # done on VM_A1, VM_B1, VM_B2; pending clone+soc-project on VM_A2
-phase_1_zerotier:                     in_progress    # VM_A1 joined+auth at .50; VM_B2 joined+auth at .53 (fresh node aa429ed844); VM_B1 was using cloned identity 9ab369cb6c which got deauthorized — VM_B1 likely offline, must regenerate identity; VM_A2 pending
+phase_1_zerotier:                     in_progress    # VM_A1 .50 (node 785fd1806c), VM_B1 .51 (node 9ab369cb6c), VM_B2 .53 (node aa429ed844 — regen'd from clone) all reachable via ping from VM_B2; VM_A2 pending
 phase_2_vm_a1_siem_core:              pending
 phase_3_vm_a1_soar_and_ai:            pending
 phase_4_vm_b1_incident_mgmt:          pending
@@ -757,14 +757,17 @@ updated_by: victim-lab (VM_B2)
     - Hostname myguest → victim-lab (hostnamectl + 127.0.1.1 in /etc/hosts)
     - Cloned soc-shared to /home/vboxuser/soc-shared (after first landing in ~/pfe/, then moved); created /home/vboxuser/soc-project/
     - Switched git remote to SSH (git@github.com:kchaouhabib/soc-shared.git); SSH key on this VM: ~/.ssh/id_ed25519 (pubkey added to user's GitHub account, titled "victim-lab (VM_B2)")
-  ⚠️ CRITICAL — VM_B1 collateral damage:
-    - The "old" node 9ab369cb6c we deauthorized in Central was actually shared between VM_B2 (clone) and the REAL VM_B1.
-    - Per the prior VM_B1 session note, VM_B1 was using IP 192.168.1.51 too. Deauthorizing 9ab369cb6c removed BOTH from the network.
-    - Next VM_B1 session MUST: `sudo zerotier-cli info` → if status is REQUESTING_CONFIGURATION or IP missing, regenerate identity the same way we did here (purge zerotier-one, rm -rf /var/lib/zerotier-one, reinstall, join cf719fd54008e4d1, ask user to authorize in Central and re-assign 192.168.1.51).
+  VM_B1 status:
+    - User confirmed VM_B1's real ZT node ID is also 9ab369cb6c (same as the clone's, which was VM_B1's identity all along — this VM was the copy, not the original).
+    - VM_B1 stayed authorized and reachable; ping from VM_B2 to 192.168.1.51 returns 0% loss (~7ms, direct P2P on same host).
+    - No collateral damage from the deauth/rejoin dance — VM_B1 is fine.
+  Connectivity verified from VM_B2:
+    - 192.168.1.50 (VM_A1) ✅ 0% loss, ~174ms (via ZT root, different physical host)
+    - 192.168.1.51 (VM_B1) ✅ 0% loss, ~7ms (P2P, same host)
+    - 192.168.1.52 (VM_A2) ❌ unreachable (Phase 1 not done on A2 yet)
   Pending for next instances:
-    - VM_B1: fix ZeroTier per the warning above
     - VM_A2: Phase 0 (clone+soc-project) + Phase 1 (install zerotier-one, join cf719fd54008e4d1, request user auth at IP .52)
-    - Verify cross-VM ping (4 nodes all up) before flipping phase_1 to complete
+    - Then verify all-4 cross-VM ping before flipping phase_1 to complete
   Notes:
     - VM_B2 still missing all Phase 5 services (Apache/MariaDB/DVWA/vsftpd/Suricata/Elastic Agent) — fresh install ahead
     - Reboot recommended before Phase 5 to confirm hostname persists
