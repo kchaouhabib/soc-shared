@@ -724,13 +724,13 @@ Since project files aren't on Git, back them up locally:
 ## Current state
 
 ```yaml
-phase_0_git_setup:                    in_progress    # done on VM_A1, VM_B1, VM_B2; pending clone+soc-project on VM_A2
-phase_1_zerotier:                     in_progress    # VM_A1 .50 (node 785fd1806c), VM_B1 .51 (node 9ab369cb6c), VM_B2 .53 (node aa429ed844 — regen'd from clone) all reachable via ping from VM_B2; VM_A2 pending
+phase_0_git_setup:                    complete       # VM_A1, VM_B1, VM_B2 done; VM_A2 descoped (see notes 2026-04-29)
+phase_1_zerotier:                     complete       # VM_A1 .50 (node 785fd1806c), VM_B1 .51 (node 9ab369cb6c), VM_B2 .53 (node aa429ed844) all reachable; VM_A2 descoped
 phase_2_vm_a1_siem_core:              pending
 phase_3_vm_a1_soar_and_ai:            pending
-phase_4_vm_b1_incident_mgmt:          pending
+phase_4_vm_b1_incident_mgmt:          in_progress    # Java 11, Cassandra 4.1.11 (heap 512M, cluster SOC-Cluster), local ES 8.19.14 (heap 1G, cluster thehive-cortex-cluster), Docker 29.4.1+compose v5, TheHive 5.7.1 + Cortex 4.0.1 (containers, network=host) all running; TheHive↔Cortex wired via API key; MISP install + feeds + Cortex analyzers + ufw still pending
 phase_5_vm_b2_victim_lab:             pending
-phase_6_vm_a2_kali_attacker:          pending
+phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
 phase_7_detection_layer_activation:   pending
 phase_8_soar_integration:             pending
 phase_9_adaptive_intelligence:        pending
@@ -738,7 +738,7 @@ phase_10_testing:                     pending
 phase_11_documentation:               pending
 
 last_updated: 2026-04-29
-updated_by: victim-lab (VM_B2)
+updated_by: incident-mgmt (VM_B1)
 ```
 
 ---
@@ -749,6 +749,56 @@ updated_by: victim-lab (VM_B2)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-04-29 — incident-mgmt (VM_B1) — Phase 4 partial: Cassandra + ES + TheHive + Cortex
+  Architectural deviation from the plan (defendable for the rapport):
+    - Master plan called for `apt install thehive` and `apt install cortex` from StrangeBee's APT repo.
+    - StrangeBee killed deb.strangebee.com / archives.strangebee.com (DNS no longer resolves, even via 8.8.8.8).
+    - TheHive 5.x is no longer distributed as .deb; only via Docker image strangebee/thehive.
+    - Decision: shifted TheHive 5 + Cortex 4 to Docker containers (network_mode: host) so they can reach Cassandra + ES on host's 127.0.0.1.
+    - Cassandra (4.1.11) and the local Elasticsearch (8.19.14) remain native apt installs because their .deb channels are still public.
+    - All other services on this VM continue per the plan.
+  Done:
+    - OS: Ubuntu 26.04 LTS (resolute, codename "resolute"). Defaults differ from the 22.04 the plan assumes — flagged but no functional impact so far.
+    - openjdk-11-jdk installed (11.0.30); JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 set in /etc/profile.d/java_home.sh
+    - Cassandra 4.1.11 from Apache repo (https://debian.cassandra.apache.org 41x main)
+        cluster_name: SOC-Cluster, listen+rpc on 127.0.0.1, MAX_HEAP_SIZE=512M, HEAP_NEWSIZE=100M
+        ports listening (localhost only): 9042 CQL, 7199 JMX, 7000 internal
+        node UN at 127.0.0.1; nodetool healthy after first start
+    - Elasticsearch 8.19.14 (local to this VM, distinct from VM_A1's SIEM ES which doesn't exist yet)
+        cluster.name: thehive-cortex-cluster, node.name: incident-mgmt-es
+        bound 127.0.0.1:9200/9300 only, xpack.security.enabled: false (defensible because of localhost binding)
+        heap: 1g via /etc/elasticsearch/jvm.options.d/heap.options
+        cluster status green, single-node mode
+    - Docker 29.4.1 + compose v5.1.3 from official Docker repo (used noble channel — no resolute packages yet)
+    - TheHive 5.7.1 container (strangebee/thehive:5.7.1) + Cortex 4.0.1 container (thehiveproject/cortex:4.0.1)
+        compose file: ~/soc-project/thehive-cortex/docker-compose.yml
+        secrets in   ~/soc-project/thehive-cortex/.env (mode 600, never committed)
+        bind mounts: ./thehive/data → /data (uid 1000), ./cortex/data → /var/cortex-jobs (uid 1001)
+        TheHive points at TH_CQL_HOSTNAMES=127.0.0.1, TH_INDEX_BACKEND=elasticsearch, TH_ELASTICSEARCH_HOSTNAMES=127.0.0.1
+        TheHive↔Cortex wired via TH_CORTEX_HOSTNAMES=127.0.0.1, TH_CORTEX_KEYS=<key in .env.local>
+        Logs confirm: `Analyzer templates already present (found 273)` ⇒ TheHive successfully called Cortex API at startup
+    - Browser-side wizards completed by user:
+        TheHive: admin@thehive.local password changed from default 'secret'
+        Cortex:  superadmin created, organization SOC-LAB created, cortex-user (read,analyze) with API key generated
+  Things to know:
+    - TheHive 5 ships with auto-loaded 15-day Platinum trial license; lab uses only Community-tier features for the rapport
+    - One 35s GC pause was logged on TheHive during initial bootstrap. It settled after warmup. If recurs, add JAVA_OPTS=-Xms1g -Xmx1g to TheHive container env.
+    - cqlsh is broken on Ubuntu 26.04 (six.moves missing in system Python 3.13). Cassandra server unaffected. Use `nodetool` for admin or pip install six --break-system-packages if needed.
+    - Real credentials live in ~/soc-project/.env.local (mode 600). Never commit. CLAUDE.md only references placeholders.
+    - Memory snapshot after Cassandra+ES+TheHive+Cortex: 6.0G used / 9.0G total. ~3G free for MISP (~1G) + headroom.
+  Pending on this VM (Phase 4 remainder):
+    - MISP via Docker Compose at https://192.168.1.51:8443 (self-signed cert)
+    - MISP feeds: CIRCL OSINT, Abuse.ch URLhaus, Feodo Tracker, AlienVault OTX, ET Compromised IPs (auto-fetch every 6h)
+    - Cortex analyzers: pip install cortexutils + AbuseIPDB / VirusTotal / MISP_Search; configure free-tier API keys
+    - ufw firewall: open 9000/9001/8443 to ZeroTier subnet only; keep 9042/9200 localhost-only
+  Outside connections seen:
+    - 192.168.1.60 hit /api/v1/status/public on TheHive — not one of our planned VMs (.50/.51/.52/.53). Likely user from a separate ZT-joined machine. Worth confirming.
+
+2026-04-29 — VM_A2 (kali-attacker) descope decision
+  - User declared VM_A2 out of scope for the SOC build going forward.
+  - Rationale: attack simulations (Phase 6 / parts of Phase 10) can be launched from any reachable host.
+  - Effect: Phase 6 marked descoped; phase_0 / phase_1 flipped to complete despite VM_A2 not catching up.
+
 2026-04-29 — victim-lab (VM_B2) — Phase 0 + Phase 1 (with VM_B1 collateral)
   Done:
     - This VM was cloned from VM_B1, so it inherited VM_B1's ZeroTier identity (shared node 9ab369cb6c, both presenting IP 192.168.1.51)
