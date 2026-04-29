@@ -724,7 +724,7 @@ Since project files aren't on Git, back them up locally:
 ## Current state
 
 ```yaml
-phase_0_git_setup:                    in_progress    # done on VM_A1; pending clone+soc-project on VM_B1, VM_B2, VM_A2
+phase_0_git_setup:                    in_progress    # done on VM_A1, VM_B1; pending clone+soc-project on VM_B2, VM_A2
 phase_1_zerotier:                     pending
 phase_2_vm_a1_siem_core:              pending
 phase_3_vm_a1_soar_and_ai:            pending
@@ -738,7 +738,7 @@ phase_10_testing:                     pending
 phase_11_documentation:               pending
 
 last_updated: 2026-04-29
-updated_by: soc-core (VM_A1)
+updated_by: incident-mgmt (VM_B1)
 ```
 
 ---
@@ -749,6 +749,22 @@ updated_by: soc-core (VM_A1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-04-29 — incident-mgmt (VM_B1)
+  Done:
+    - Installed git via apt (was missing on this VM)
+    - Cloned soc-shared to ~/soc-shared/ (initially landed in ~/pfe/, then moved to canonical ~/ location)
+    - Created empty ~/soc-project/ (local-only working folder)
+    - Verified `cd ~/soc-shared && git pull` returns "Already up to date."
+    - Confirmed VM identity: hostname=incident-mgmt, ZeroTier IP=192.168.1.51 (interface ztdiyzommr)
+  Pending for next instance on VM_B2 (victim-lab) and VM_A2 (kali-attacker):
+    - git clone https://github.com/kchaouhabib/soc-shared.git ~/soc-shared
+    - mkdir ~/soc-project
+    - Verify: cd ~/soc-shared && git pull   (should report "Already up to date.")
+    - Then phase_0_git_setup flips to "complete"
+  Notes:
+    - On VM_B1 the user prefers the canonical ~/soc-shared/ path over working out of ~/pfe/. Resolved the open question from the previous note.
+    - No project work started yet on this VM — Phase 4 (Cassandra+ES+TheHive+Cortex+MISP) is still pending.
+
 2026-04-29 — soc-core (VM_A1)
   Done:
     - Created GitHub repo https://github.com/kchaouhabib/soc-shared (public)
