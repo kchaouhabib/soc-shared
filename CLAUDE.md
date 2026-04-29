@@ -724,7 +724,7 @@ Since project files aren't on Git, back them up locally:
 ## Current state
 
 ```yaml
-phase_0_git_setup:                    pending
+phase_0_git_setup:                    in_progress    # done on VM_A1; pending clone+soc-project on VM_B1, VM_B2, VM_A2
 phase_1_zerotier:                     pending
 phase_2_vm_a1_siem_core:              pending
 phase_3_vm_a1_soar_and_ai:            pending
@@ -737,8 +737,8 @@ phase_9_adaptive_intelligence:        pending
 phase_10_testing:                     pending
 phase_11_documentation:               pending
 
-last_updated: NOT_YET
-updated_by: NOT_YET
+last_updated: 2026-04-29
+updated_by: soc-core (VM_A1)
 ```
 
 ---
@@ -749,7 +749,21 @@ updated_by: NOT_YET
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
-[no entries yet — first session pending]
+2026-04-29 — soc-core (VM_A1)
+  Done:
+    - Created GitHub repo https://github.com/kchaouhabib/soc-shared (public)
+    - Bootstrapped ~/soc-shared/ with CLAUDE.md, PROJECT-MASTER-PLAN.md, README.md, docs/.gitkeep
+    - Initial commit 7429194 pushed to origin/main
+    - Created empty ~/soc-project/ (local-only working folder, not on Git)
+    - Git identity already configured globally (Habib Kchaou / kchaou.habib67@gmail.com)
+  Pending for next instance on each remaining VM (VM_B1, VM_B2, VM_A2):
+    - git clone https://github.com/kchaouhabib/soc-shared.git ~/soc-shared
+    - mkdir ~/soc-project
+    - Verify: cd ~/soc-shared && git pull   (should report "Already up to date.")
+    - Then phase_0_git_setup flips to "complete"
+  Notes:
+    - Source markdown files were copied from /home/vboxuser/pfe/ on VM_A1
+    - Keep that pfe/ folder as the editable working location, or delete it now that ~/soc-shared/ is the canonical source — your call
 ```
 
 ---
