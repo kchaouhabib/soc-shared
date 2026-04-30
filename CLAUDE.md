@@ -750,7 +750,7 @@ phase_1_zerotier:                     complete       # VM_A1 .50 (node 785fd1806
 phase_2_vm_a1_siem_core:              complete       # ES 8.19.14 (4G heap, single-node, soc-core), Kibana 8.19.14, Logstash 8.19.14 (beats:5044, syslog:5140 → ES), Elastic Agent + Fleet Server 8.19.14 on :8220 enrolled in fleet-server-policy. ufw active with allow from 192.168.1.0/24. SOC-Core OS is Ubuntu 26.04 LTS (matches VM_B1, plan said 22.04).
 phase_3_vm_a1_soar_and_ai:            pending
 phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive + Cortex (custom soc-cortex:4.0.1-analyzers image, process mode) + MISP all running; 4 MISP feeds enabled with 6h cron; 4 Cortex analyzers verified end-to-end; ufw active with ZT-only allow rules
-phase_5_vm_b2_victim_lab:             in_progress    # Apache+PHP8.5+MariaDB up; DVWA at /dvwa (admin/password, default security 'low'); vsftpd:21 + ssh:22 (socket-activated) + 3 weak users (testuser1/password123, testuser2/admin, webadmin/webadmin); Suricata 8.0.3 on ztdiyzommr with 49911 ET Open rules + daily refresh cron; Apache extended log format 'soc' at access_soc.log; Elastic Agent 8.19.14 enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45), HEALTHY. PENDING: integrations to be attached on VM_A1 Kibana (System, Apache HTTP Server → access_soc.log+error.log, Custom Logs → eve.json+vsftpd.log). DEFERRED until VM_A1 phase 3: MITRE Tagger /scan/suricata in cron, /refresh from classification.config
+phase_5_vm_b2_victim_lab:             complete       # Apache+PHP8.5+MariaDB up; DVWA at /dvwa; vsftpd:21 + ssh:22 + 3 weak users; Suricata 8.0.3 with 49911 ET Open rules; Elastic Agent enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45) HEALTHY; integrations attached on VM_A1 Kibana: system-2 + apache-victim-lab (/var/log/apache2/access_soc.log+access.log+error.log) + suricata-victim-lab (/var/log/suricata/eve.json) + vsftpd-victim-lab (Custom Logs /var/log/vsftpd.log → dataset 'vsftpd'). Used native Suricata + Apache integrations (NOT Custom Logs) — pre-parsed/ECS/dashboards. Suricata index growing live (~58k+ docs at attach time). DEFERRED until VM_A1 phase 3: MITRE Tagger /scan/suricata in cron, /refresh from classification.config
 phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
 phase_7_detection_layer_activation:   pending
 phase_8_soar_integration:             pending
@@ -758,8 +758,8 @@ phase_9_adaptive_intelligence:        pending
 phase_10_testing:                     pending
 phase_11_documentation:               pending
 
-last_updated: 2026-04-29
-updated_by: victim-lab (VM_B2)
+last_updated: 2026-04-30
+updated_by: soc-core (VM_A1)
 ```
 
 ---
