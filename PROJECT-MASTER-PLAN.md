@@ -67,7 +67,7 @@ The system is built on 4 VMs distributed across 2 physical hosts, connected thro
 | VM_B2 victim-lab | 3 GB | 4 GB | 40 GB | 80 GB |
 | VM_A2 kali-attacker | 3 GB | 4 GB | 40 GB | 80 GB |
 
-**Why VM_A1 needs more RAM than originally estimated:** Ollama with the llama3.1:8b model requires ~6 GB when loaded into memory. Combined with Elasticsearch (~4 GB heap), Kibana, Logstash, Fleet Server, n8n, and the four Flask APIs, the safe baseline is 16 GB and recommended is 20 GB.
+**Why VM_A1 needs more RAM than originally estimated:** Ollama with the llama3.1:8b model requires ~6 GB when loaded into memory. Combined with Elasticsearch (heap dropped to 2 GB after re-architecture), Kibana, Logstash, Fleet Server, n8n, and the **two** Flask APIs (re-architected 2026-05-05 — see Section 6.4), the safe baseline is 16 GB and recommended is 20 GB. The deployed VM is 13 GB — workable thanks to swap and the heap trim, but tight; raise RAM if alert volume grows.
 
 **SSD strongly recommended for VM_A1** — Elasticsearch indexing performance is heavily disk-bound. Spinning disks make Kibana queries slow.
 
@@ -133,19 +133,21 @@ ZeroTier was chosen over bridged networking because the two physical PCs may be 
 
 ### 6.4 Custom AI / Intelligence Services (built for this project)
 
-These are the original contributions of the PFE — five Flask microservices that solve specific SOC problems:
+These are the original contributions of the PFE — **two Flask microservices** that solve problems no built-in covers, plus n8n workflows that orchestrate stock components for everything else.
 
-**Ollama (port 11434)** — local LLM runtime. Runs llama3.1:8b on VM_A1. Powers all AI features in the project without any API cost. Replaces what would otherwise be Anthropic/OpenAI calls. Slower and slightly less capable than Claude or GPT-4, but free and self-contained.
+> **Re-architecture note (2026-05-05):** The original plan called for five Flask services. Two of them were dropped during Phase 3 because stock components already cover the same job. This made the stack smaller and more defendable. See *Dropped services* at the bottom of this section.
 
-**ML Anomaly Detection API (port 5000)** — Flask service running an Isolation Forest model trained on Elasticsearch alert history. Every alert that enters the system gets an anomaly score (0–1). High score = unusual = likely a real threat. Low score = matches normal patterns = probably routine. Used by n8n to gate which alerts become full cases versus go to a daily digest.
+**Ollama (port 11434)** — local LLM runtime. Runs llama3.1:8b on VM_A1. Powers all AI features in the project without any API cost. Replaces what would otherwise be Anthropic/OpenAI calls. Slower and slightly less capable than Claude or GPT-4, but free and self-contained. Configured with `OLLAMA_KEEP_ALIVE=24h` to keep the model warm in RAM (cold load is ~5 min from disk on this VM).
 
-**NLP Summarization API (port 5001)** — Flask service that takes a technical alert JSON and returns a 2–3 sentence human-readable summary. Calls Ollama internally. The output goes into TheHive case descriptions so a Level 1 analyst can read "an attacker tried 17 SSH passwords from this IP" instead of parsing Elastic's verbose alert object. Solves the "context blindness" problem.
+**ML Anomaly Detection API (port 5000)** — Flask service running an Isolation Forest model. Every alert that enters the system gets an anomaly score (0–1). High score = unusual = likely a real threat. Low score = matches normal patterns = probably routine. Used by n8n to gate which alerts become full cases versus go to a daily digest. Bootstraps from a synthetic alert distribution on first start, retrains via `POST /train` on the last 30 days of `.alerts-security.alerts-default` once real data accumulates. Kept because no Basic-tier Elastic feature provides equivalent scoring (Anomaly Detection jobs require a Platinum subscription).
 
-**Correlation Engine (port 5002)** — Flask service with SQLite state. Decides whether each incoming alert creates a new case or attaches to an existing one. Uses sliding-window grouping by source IP, MITRE ATT&CK tactic progression detection, suppression for alert storms, and a whitelist for known good IPs. Solves the "1 attack = 7 cases" problem and the alert fatigue problem in one place. The biggest original contribution of the project.
+**Correlation Engine (port 5002)** — Flask service with SQLite state. Decides whether each incoming alert creates a new case or attaches to an existing one. 30-minute same-(source_ip, rule_id) bucket window for storm dedup; **2-hour cross-tactic kill-chain window** that escalates a case the moment a second MITRE tactic appears from the same source IP. Whitelist for known-good IPs; daily-digest queue for low-severity, low-anomaly alerts. Solves the "1 attack = 7 cases" problem and the alert-fatigue problem in one place. The biggest original contribution of the project — kill-chain detection across MITRE tactics is not built into Kibana alert suppression or TheHive 5 case grouping.
 
-**MITRE Auto-Tagger (port 5003)** — Flask service that automatically assigns MITRE ATT&CK tactic and technique IDs to any rule (Suricata, Kibana, AI-generated) based on its content. Uses TF-IDF keyword matching against the official MITRE ATT&CK JSON for fast cases, and Ollama for ambiguous ones. Refreshes the ATT&CK data weekly. Removes all manual rule tagging.
+**Dropped services (replaced by built-ins or n8n+Ollama):**
 
-**AI Rule Generator (part of NLP API)** — endpoint that takes a MISP threat report and outputs a deployable Kibana detection rule and Suricata rule. Triggered automatically when MISP receives a new event from its feeds. Closes the loop: new threat reports → new detection rules deployed within minutes, no human writing rules.
+- ~~**NLP Summarization API (port 5001)**~~ — replaced by an n8n HTTP-Request node calling Ollama directly with `format:"json"`. Prompt templates live in the n8n workflow JSON. No Flask wrapper buys us anything.
+- ~~**MITRE Auto-Tagger (port 5003)**~~ — Kibana's detection-engine UI/API already takes MITRE tags via its `threat[]` field at rule definition time; Elastic prebuilt rules ship pre-tagged; Sigma carries `attack.t####` tags through `sigma2elastic`; community classtype-to-MITRE JSONs cover Suricata's gaps. Building a TF-IDF tagger duplicates these built-ins.
+- ~~**AI Rule Generator (was part of NLP API)**~~ — re-implemented as an n8n workflow node: MISP webhook → HTTP-Request to Ollama with `format:"json"` returning `{kibana_rule, suricata_rule, tactic_id, technique_id}` in one round-trip → Kibana API push + Suricata SSH deploy.
 
 ### 6.5 Vulnerable Target Layer (VM_B2 only)
 
@@ -181,13 +183,13 @@ ML model learns normal alert patterns from Elasticsearch history. Scores every n
 
 ## 8. Custom AI Pipeline — How AI Augments the SOC
 
-Three places where AI replaces manual SOC work:
+Three places where AI replaces manual SOC work. After the 2026-05-05 re-architecture, the LLM-driven steps run inside n8n workflows that call Ollama via HTTP nodes — no separate Flask wrapper.
 
-**Adaptive rule creation:** When a new threat report arrives in MISP, the AI Rule Generator reads it and produces a deployable Kibana + Suricata rule. The MITRE Auto-Tagger immediately assigns ATT&CK tags. The rule deploys with no human in the loop. The SOC's detection coverage grows automatically as new threats emerge.
+**Adaptive rule creation:** When a new threat report arrives in MISP, n8n Workflow 4 fires. An HTTP-Request node POSTs the threat description to Ollama with `format:"json"` and a prompt template that asks for `{kibana_rule, suricata_rule, tactic_id, technique_id}` in one response. The workflow then pushes the Kibana rule via the Kibana API and deploys the Suricata rule via SSH. The SOC's detection coverage grows automatically as new threats emerge.
 
-**Alert summarization:** Every alert reaching TheHive has its raw JSON converted to plain English by the NLP API. A Level 1 analyst reads understandable incident descriptions instead of parsing technical telemetry.
+**Alert summarization:** Every alert reaching TheHive has its raw JSON converted to plain English. n8n Workflow 1 calls Ollama with a summarization prompt right before creating the TheHive case. A Level 1 analyst reads understandable incident descriptions instead of parsing technical telemetry.
 
-**Chain reasoning:** When the Correlation Engine sees multiple alerts from the same source but the MITRE tactic progression is ambiguous, it asks Ollama to reason about whether the alerts form a coordinated attack. Catches subtle multi-stage attacks that pure rule-based logic would miss.
+**Chain reasoning:** The Correlation Engine detects MITRE tactic progression deterministically inside its 2-hour window (no LLM needed for the common case). For ambiguous chains the engine can optionally call Ollama via HTTP for narrative reasoning, but the rule-based path covers Phase 7 testing.
 
 All three use Ollama locally — no internet required, no API cost.
 
@@ -246,23 +248,24 @@ Sub-steps:
 
 ---
 
-### Phase 3 — VM_A1 SOAR + AI services (n8n + Ollama + 4 Flask APIs)
-**Goal:** Deploy the orchestration engine and all custom AI services on top of the SIEM.
+### Phase 3 — VM_A1 SOAR + AI services (n8n + Ollama + 2 Flask APIs)
+**Goal:** Deploy the orchestration engine and the two original AI microservices on top of the SIEM. Re-architected 2026-05-05: dropped two Flask services that duplicated built-ins.
 
 Sub-steps:
 - Install Node.js 20 and n8n globally
-- Configure n8n service with environment variables and systemd unit
+- Configure n8n service with environment variables and systemd unit on port 5678
 - Install Ollama and pull `llama3.1:8b` model (~5 GB download, ~6 GB RAM at runtime)
-- Verify Ollama API responds on port 11434 with a test prompt
+- Add an Ollama systemd drop-in setting `OLLAMA_KEEP_ALIVE=24h` so the model stays warm
+- Verify Ollama API responds on port 11434 with a test prompt (use `--max-time >=600` on first call — cold load is ~5 min on a slow disk)
+- Add an 8 GiB swapfile and lower the Elasticsearch JVM heap from 4 GiB to 2 GiB so Ollama has room to load on a 13 GiB VM
 - Create Python virtual environments for each Flask service in `~/soc-project/<service>/venv/`
-- Deploy ML Anomaly Detection API (port 5000) — train initial Isolation Forest on whatever ES data exists or synthetic data
-- Deploy NLP Summarization API (port 5001) — wired to Ollama backend
-- Deploy Correlation Engine (port 5002) — initialize SQLite state DB
-- Deploy MITRE Auto-Tagger (port 5003) — download MITRE ATT&CK JSON, build TF-IDF index. Classtype map will be empty until Phase 5.
-- Create systemd services for all four Flask APIs (point to `/opt/<service>/` for stable system paths)
+- Deploy ML Anomaly Detection API (port 5000) — bootstraps from synthetic alerts; retrains via `POST /train` on the last 30 days of `.alerts-security.alerts-default`
+- Deploy Correlation Engine (port 5002) — SQLite state at `/opt/correlation-engine/state.db`; 30-min bucket window, 2-hour kill-chain window
+- Create systemd services for the two Flask APIs (point to `/opt/<service>/` for stable system paths — symlinks back to `~/soc-project/<service>/`)
 - Verify all services healthy via `/health` endpoints
+- Verify the Correlation Engine end-to-end with the six action paths: `create_new`, `add_to_existing`, `escalate_existing`, kill-chain escalate, `queue`, `suppress`
 
-**Outcome:** All AI services running on VM_A1. n8n UI accessible at `http://192.168.1.50:5678`.
+**Outcome:** All AI services running on VM_A1. n8n UI accessible at `http://192.168.1.50:5678`. NLP and MITRE-tagging steps deferred into n8n workflows in Phase 8 instead of standalone Flask services.
 
 ---
 
@@ -306,12 +309,12 @@ Sub-steps:
 - Install Suricata — configure to listen on the ZeroTier interface (`zt6q3gtnzl`)
 - Install suricata-update; enable ET Open and abuse.ch SSL blacklist sources
 - Run initial rule download (~50,000 rules)
-- Set up daily cron to refresh Suricata rules and call MITRE Auto-Tagger to tag any new classtypes
+- Set up daily cron to refresh Suricata rules (`suricata-update && systemctl reload suricata`). MITRE classtype tagging is no longer performed by a custom Tagger (dropped 2026-05-05); ET Open's existing `metadata: mitre_attack_id` lines are preserved as-is.
 - Download and enroll Elastic Agent with Fleet Server using the enrollment token from Phase 2
 - In Kibana Fleet UI, add integrations to victim-lab agent policy: System, Apache HTTP Server, Custom Logs (for Suricata's `eve.json`)
 - Configure Apache logging format with detailed fields
 - Configure firewall
-- After Suricata install: trigger MITRE Tagger `/refresh` so the classtype map is built from `/etc/suricata/classification.config`
+- (Removed 2026-05-05) Original plan called for triggering the MITRE Tagger `/refresh` after Suricata install — the Tagger was dropped during Phase 3 in favor of Kibana's built-in `threat[]` tagging at rule definition time. No post-install action needed.
 
 **Outcome:** Vulnerable target online at `http://192.168.1.53/dvwa`. Suricata inspecting all traffic. Elastic Agent shipping host + Suricata logs to VM_A1.
 
@@ -338,8 +341,8 @@ Sub-steps:
 - In Kibana → Security → Rules → Add Elastic rules: install and enable all prebuilt detection rules (~1000 rules covering full MITRE ATT&CK matrix)
 - Create the 13 custom Kibana SIEM detection rules via API: SSH brute force, SQLi, XSS, command injection, port scan, web shell, sudo escalation, reverse shell, attacker SSH login, data exfiltration, file integrity changes
 - Suricata rules are already loaded from Phase 5 — verify by checking Suricata stats
-- Trigger initial MITRE Auto-Tagger sweep on Kibana rules: any rule missing MITRE tags gets auto-tagged from its name + description + query
-- Trigger initial MITRE Auto-Tagger sweep on Suricata rules: any rule without `mitre_tactic_id` metadata gets tagged based on classtype + msg field
+- All custom Kibana rules carry MITRE `threat[]` tags at creation time (Kibana detection-engine UI/API takes them natively); Elastic prebuilts ship pre-tagged. No tagger sweep needed.
+- For Suricata, rely on ET Open's existing `metadata: mitre_attack_id` on the subset of rules that have it; for the rest, accept the gap (or apply a community classtype-to-MITRE JSON mapping). No custom tagger.
 - Verify MISP threat intel is populating Elasticsearch indices (MISP-to-ES connector)
 - Configure Kibana threat intel matching rules: any document matching a MISP IOC fires an alert
 
@@ -357,7 +360,7 @@ Sub-steps:
 - Generate SSH key on VM_A1, copy to VM_B2 for passwordless connection used by active response
 - Build n8n Workflow 1 — main alert pipeline:
   - Receive webhook → call Correlation Engine → branch on response action
-  - If `create_new`: call ML API for score → call NLP API for summary → create TheHive case
+  - If `create_new`: call ML API for score → call Ollama via n8n HTTP-Request node for summary (format:"json") → create TheHive case
   - If `add_to_existing`: PATCH the existing TheHive case with the new observable
   - If `escalate_existing`: same as add but also raise severity
   - If `suppress` / `queue`: log to file, no case created
@@ -365,7 +368,7 @@ Sub-steps:
 - Build n8n Workflow 2 — TheHive observable enrichment via Cortex
 - Build n8n Workflow 3 — daily digest (scheduled at 8am)
 - Build n8n Workflow 4 — MISP-driven AI rule generation
-- Build n8n Workflow 5 — weekly MITRE rule maintenance (scheduled Mondays 4am)
+- Build n8n Workflow 5 — weekly maintenance (scheduled Mondays 4am): retrain the ML Anomaly model via `POST /train`. (The original plan also called for a MITRE rule rescan here; that step is obsolete after the Tagger was dropped — Kibana custom rules carry tags at creation time, ET Open carries its own metadata.)
 - Export all workflows as JSON to `~/soc-project/n8n/workflows/` (local only, NOT Git)
 
 **Outcome:** End-to-end automation. Every detected attack creates an enriched, summarized, deduplicated case in TheHive. Critical attacks trigger automatic IP blocking. New threat reports auto-generate rules.
@@ -376,10 +379,8 @@ Sub-steps:
 **Goal:** Make the system improve itself over time without manual intervention.
 
 Sub-steps:
-- Configure cron on VM_B2: daily `suricata-update` + auto-tag at 3am
-- Configure cron on VM_A1: weekly MITRE ATT&CK refresh at Sunday 4am (re-downloads JSON, rebuilds TF-IDF index)
-- Configure n8n schedule: weekly Kibana rule rescan for any new rules added during the week
-- Configure ML API retraining: weekly retrain on the past 30 days of Elasticsearch alerts to keep the anomaly model current
+- Configure cron on VM_B2: daily `suricata-update` at 3am (no auto-tag step — Tagger dropped 2026-05-05)
+- Configure ML API retraining: weekly retrain on the past 30 days of Elasticsearch alerts via `POST :5000/train` to keep the anomaly model current
 - Configure MISP feed schedule (already set in Phase 4, verify)
 - Set up monitoring: simple uptime checks on every service, log to a status dashboard
 
@@ -432,15 +433,13 @@ Sub-steps:
 | Kibana detection rules | n8n webhook (A1:5678) | Alert delivery | HTTP |
 | n8n | Correlation Engine (A1:5002) | Alert grouping decision | HTTP |
 | n8n | ML API (A1:5000) | Anomaly scoring | HTTP |
-| n8n | NLP API (A1:5001) | Alert summarization | HTTP |
+| n8n | Ollama (A1:11434) | Alert summarization + AI rule generation (HTTP-Request node, format:"json") | HTTP |
 | n8n | TheHive API (B1:9000) | Case creation/update | HTTP |
 | n8n | Cortex API (B1:9001) | Observable enrichment | HTTP |
 | n8n | victim-lab SSH (B2:22) | Active response (iptables) | SSH |
 | TheHive | n8n webhook | Case event notifications | HTTP |
 | MISP | n8n webhook | New event notifications | HTTP |
-| Correlation Engine | Ollama (A1:11434) | Chain reasoning | HTTP |
-| NLP API | Ollama (A1:11434) | Summarization + rule generation | HTTP |
-| MITRE Tagger | Ollama (A1:11434) | Ambiguous rule disambiguation | HTTP |
+| Correlation Engine | Ollama (A1:11434) | Chain reasoning (optional, ambiguous-chain only) | HTTP |
 | ML API | Elasticsearch (A1:9200) | Training data fetch | HTTPS |
 
 ---
@@ -473,7 +472,7 @@ Sub-steps:
    Subsequent alerts attach as observables/timeline entries to that case
 
 8. The case gets:
-   - NLP summary as description (from NLP API → Ollama)
+   - NLP summary as description (n8n HTTP-Request node → Ollama, format:"json")
    - Anomaly score in custom field (from ML API)
    - MITRE ATT&CK tags
    - Cortex enrichment (AbuseIPDB lookup of source IP, etc.)
