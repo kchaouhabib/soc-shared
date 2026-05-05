@@ -747,8 +747,8 @@ Since project files aren't on Git, back them up locally:
 ```yaml
 phase_0_git_setup:                    complete       # VM_A1, VM_B1, VM_B2 done; VM_A2 descoped (see notes 2026-04-29)
 phase_1_zerotier:                     complete       # VM_A1 .50 (node 785fd1806c), VM_B1 .51 (node 9ab369cb6c), VM_B2 .53 (node aa429ed844) all reachable; VM_A2 descoped
-phase_2_vm_a1_siem_core:              complete       # ES 8.19.14 (4G heap, single-node, soc-core), Kibana 8.19.14, Logstash 8.19.14 (beats:5044, syslog:5140 → ES), Elastic Agent + Fleet Server 8.19.14 on :8220 enrolled in fleet-server-policy. ufw active with allow from 192.168.1.0/24. SOC-Core OS is Ubuntu 26.04 LTS (matches VM_B1, plan said 22.04).
-phase_3_vm_a1_soar_and_ai:            pending
+phase_2_vm_a1_siem_core:              complete       # ES 8.19.14 single-node (heap dropped 4G→2G in phase 3 to fit Ollama; backup at heap.options.bak-20260505), Kibana 8.19.14, Logstash 8.19.14 (beats:5044, syslog:5140 → ES), Elastic Agent + Fleet Server 8.19.14 on :8220 enrolled in fleet-server-policy. ufw active with allow from 192.168.1.0/24. SOC-Core OS is Ubuntu 26.04 LTS (matches VM_B1, plan said 22.04).
+phase_3_vm_a1_soar_and_ai:            complete       # n8n 2.18.5 systemd on :5678; Ollama 0.22.1 + llama3.1:8b warm with KEEP_ALIVE=24h (cold load ~5min, ~0.3 tok/s CPU-only); 8G swap added. RE-ARCHITECTED: only 2/4 Flask APIs built — ML Anomaly :5000 (IsolationForest, /train pulls .alerts-security.alerts-default), Correlation Engine :5002 (SQLite, 30-min bucket / 2h kill-chain windows; 6 actions verified). DROPPED: NLP API (replaced by n8n→Ollama directly via HTTP node) and MITRE Auto-Tagger (replaced by Kibana's built-in threat[] field at rule definition + Sigma tags + community classtype JSONs). systemd units for ml-api + correlation-engine; /opt/<svc> symlinks back to ~/soc-project/<svc>.
 phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive + Cortex (custom soc-cortex:4.0.1-analyzers image, process mode) + MISP all running; 4 MISP feeds enabled with 6h cron; 4 Cortex analyzers verified end-to-end; ufw active with ZT-only allow rules
 phase_5_vm_b2_victim_lab:             complete       # Apache+PHP8.5+MariaDB up; DVWA at /dvwa; vsftpd:21 + ssh:22 + 3 weak users; Suricata 8.0.3 with 49911 ET Open rules; Elastic Agent enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45) HEALTHY; integrations attached on VM_A1 Kibana: system-2 + apache-victim-lab (/var/log/apache2/access_soc.log+access.log+error.log) + suricata-victim-lab (/var/log/suricata/eve.json) + vsftpd-victim-lab (Custom Logs /var/log/vsftpd.log → dataset 'vsftpd'). Used native Suricata + Apache integrations (NOT Custom Logs) — pre-parsed/ECS/dashboards. Suricata index growing live (~58k+ docs at attach time). DEFERRED until VM_A1 phase 3: MITRE Tagger /scan/suricata in cron, /refresh from classification.config
 phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
@@ -758,7 +758,7 @@ phase_9_adaptive_intelligence:        pending
 phase_10_testing:                     pending
 phase_11_documentation:               pending
 
-last_updated: 2026-04-30
+last_updated: 2026-05-05
 updated_by: soc-core (VM_A1)
 ```
 
@@ -770,6 +770,64 @@ updated_by: soc-core (VM_A1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-05 — soc-core (VM_A1) — Phase 3 complete: SOAR + AI services with re-architecture
+  Done:
+    - n8n 2.18.5 systemd unit /etc/systemd/system/n8n.service running as vboxuser on :5678
+      (env: N8N_HOST=0.0.0.0, WEBHOOK_URL=http://192.168.1.50:5678/, N8N_USER_FOLDER=~/.n8n).
+      First-start migrations completed cleanly. HTTP 200 on /.
+    - Ollama 0.22.1 + llama3.1:8b (4.9 GB, sha256 667b0c1932bc) pulled cleanly at ~5.4 MB/s
+      (the network bottleneck from Phase 2 is gone). Systemd drop-in
+      /etc/systemd/system/ollama.service.d/override.conf sets OLLAMA_KEEP_ALIVE=24h so the
+      model stays warm. Cold load is ~5 min on this disk (mmap=false, ~17 MB/s tensor read);
+      warm-path generation runs at ~0.3 tok/s CPU-only — slow but functional for batch SOAR
+      use. First curl probe MUST use --max-time >=600 or the load is canceled mid-load.
+    - Memory budget fix: VM has 13 GB total; with ES@4G + Kibana + Logstash + agentbeats,
+      Ollama refused to load (needs 4.8 GB free). Added 8 G swapfile (/swapfile, persistent
+      via /etc/fstab) AND dropped ES heap 4G→2G via /etc/elasticsearch/jvm.options.d/heap.options
+      (backup at heap.options.bak-20260505). ES recovered to yellow (single-node, 72 primaries
+      active, 29 unassigned replicas as expected).
+    - Re-architecture decision (defendable for the rapport):
+        DROPPED MITRE Auto-Tagger — Kibana detection-engine UI/API already takes MITRE tags
+            via threat[] at rule definition; Elastic prebuilt rules ship pre-tagged; Sigma
+            preserves attack.t#### tags through sigma2elastic; community classtype-to-MITRE
+            JSONs cover Suricata. Building a TF-IDF tagger duplicates built-ins.
+        DROPPED NLP API (Flask + Ollama wrapper) — n8n HTTP Request node can POST to
+            Ollama directly with prompt templates stored in workflow JSON. No Flask shim
+            needed. Workflow 1 will use n8n→Ollama; Workflow 4 (MISP→AI rule generation)
+            also uses n8n→Ollama with format:json for structured rule output.
+        KEPT ML Anomaly API on :5000 — IsolationForest is genuinely original; no Basic-tier
+            Elastic ML equivalent. /opt/ml-api symlinks ~/soc-project/ml-api/. Bootstraps
+            from synthetic alerts (n=1000, 5% anomalous), retrains via POST /train on
+            .alerts-security.alerts-default once data exists. EnvironmentFile points at
+            ~/soc-project/.env.local for ELASTIC_PASSWORD. Smoke /health + /score green.
+        KEPT Correlation Engine on :5002 — kill-chain detection across MITRE tactics is
+            not built into Kibana suppression or TheHive 5 alert grouping. SQLite state at
+            /opt/correlation-engine/state.db. 30-min same-(ip,rule) bucket window; 2h
+            cross-tactic chain window. All 6 actions verified end-to-end:
+              create_new / add_to_existing / escalate_existing / kill-chain escalate /
+              queue (low signal) / suppress (whitelist).
+    - Both Flask APIs run under gunicorn (1 worker, 127.0.0.1 only — n8n on same host
+      reaches them via localhost). Auto-restart on failure. Enabled at boot.
+  Pending:
+    - VM_A1 phase 7+: detection layer activation (custom 13 SOC rules, MITRE tagging at
+      rule-definition time per the new architecture). Phase 5's deferred items
+      ("MITRE Tagger /scan/suricata cron + /refresh from classification.config") are now
+      OBSOLETE — that whole approach was dropped. Use the built-in path instead.
+    - When real alerts start flowing, run POST :5000/train to retire the synthetic model.
+    - Run an end-to-end SOAR smoke: n8n webhook → /correlate → n8n→Ollama summarize →
+      TheHive case create. Belongs in phase 8.
+  Things to know:
+    - Sudo password unchanged. Memory rule "no custom code" was clarified by user this
+      session: it means "don't reinvent built-ins" (e.g. Kibana's MITRE tagging UI is the
+      built-in we should use), NOT "ask before any code". Memory file
+      feedback_no_custom_code_or_configs.md updated accordingly.
+    - The Fact-Forcing Gate hook fires on Bash/Write — present facts in the SAME assistant
+      turn as the tool call, not the prior one. Otherwise it re-prompts.
+    - ~/soc-project/nlp-api/ still exists with empty venv from before the drop — harmless;
+      can be removed at any cleanup pass.
+    - VM provisioned at 13 GB (plan called for 12 min / 20 recommended). Swap+heap-trim
+      keeps things working. If alert volume grows, raise VM RAM.
+
 2026-04-29 — victim-lab (VM_B2) — Phase 5 partial: Elastic Agent enrolled
   Done:
     - Downloaded elastic-agent 8.19.14 tarball (matches VM_A1 stack version), installed via
