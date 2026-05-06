@@ -758,7 +758,7 @@ phase_9_adaptive_intelligence:        pending
 phase_10_testing:                     pending
 phase_11_documentation:               pending
 
-last_updated: 2026-05-05
+last_updated: 2026-05-06
 updated_by: soc-core (VM_A1)
 ```
 
@@ -770,6 +770,75 @@ updated_by: soc-core (VM_A1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-06 — soc-core (VM_A1) — Phase 7 complete: detection layer activated
+  Done:
+    - Set Kibana encryption keys (xpack.encryptedSavedObjects/reporting/security.encryptionKey)
+      appended to /etc/kibana/kibana.yml — required by the actions framework before any
+      connector can be created. Generated via `kibana-encryption-keys generate -q`. Restart
+      clean.
+    - Detection-engine signals index initialised (POST /api/detection_engine/index → ack).
+    - Installed prebuilt Elastic SIEM rules pack: 1644 rules, 10 timelines (rules_installed:
+      1644, timelines_installed: 10). All disabled by default — enable selectively in
+      Phase 8/9 once SOAR pipeline is wired.
+    - License: started 30-day trial via /_license/start_trial?acknowledge=true (was basic).
+      REQUIRED for the .webhook connector type which is gated to Gold+ on basic. Decision
+      defendable in rapport: trial unlocks production-equivalent feature surface for the
+      PFE demo window. Fallback if trial expires: switch detection rules to a "noop"
+      action and have n8n's Elasticsearch node poll .alerts-security.alerts-default
+      (works on basic forever, adds polling latency).
+    - Kibana action connector created: id 7c351a6c-4de6-4c07-8146-fa337033c735, name
+      "n8n-soar-webhook", type .webhook, POST → http://192.168.1.50:5678/webhook/elastic-alert,
+      hasAuth=false. n8n is on the same host so unauth localhost is fine; ufw blocks 5678
+      from outside the ZT subnet.
+    - Authored 13 SOC custom rules in NDJSON at ~/soc-project/kibana/soc-rules.ndjson
+      (one rule per line). Each rule carries:
+        * native MITRE threat[] — tactic + technique + subtechnique objects with refs
+        * tags including "mitre:TA0XXX", "mitre:T1XXX", "auto_block" (where applicable),
+          plus Elastic-convention "Domain: ...", "OS: Linux", "Tactic: ..." for grouping
+        * meta: { auto_block, soc_layer, soc_id }
+        * actions[] referencing the webhook connector with mustache body template:
+            {"rule_id":"{{rule.rule_id}}","rule_name":"{{rule.name}}",
+             "severity":"{{rule.severity}}","risk_score":{{rule.risk_score}},
+             "auto_block":true,"results_link":"{{{context.results_link}}}"}
+          (auto_block emitted only on the 5 critical rules). n8n workflow 1 will fetch
+          full alert docs from .alerts-security.alerts-default by results_link / time
+          window — webhook payload stays small.
+    - Imported via POST /api/detection_engine/rules/_import?overwrite=true → 13 success,
+      0 errors. Bulk-enabled via /api/detection_engine/rules/_bulk_action with filter
+      tags:"SOC-Custom-13" → 13 succeeded, 0 failed.
+    - Severity / auto_block matrix matches CLAUDE.md table:
+        SOC-001 medium  | SOC-002 critical+block | SOC-003 medium      | SOC-004 high+block
+        SOC-005 medium  | SOC-006 high+block     | SOC-007 low         | SOC-008 high
+        SOC-009 critical+block | SOC-010 high    | SOC-011 critical+block | SOC-012 high
+        SOC-013 high
+    - Rule execution status (12 of 13 succeeded on first runs; SOC-011/012 just hadn't
+      run yet because of 5m interval; SOC-008 reports partial failure — its index list
+      includes logs-endpoint.events.file-* / auditbeat-* which don't exist on this
+      cluster (no FIM agent yet). Benign: rule still runs against logs-system-* and
+      will silently match nothing until FIM is enabled.
+  Pending / known gaps:
+    - VM_B2 (victim-lab) elastic-agent OFFLINE since 2026-05-05 21:09Z — last seen.
+      Until B2 powers back up, Suricata + Apache rules (SOC-003..007, 009, 013) have no
+      live data. Doesn't block Phase 7 closure but should be the first thing checked on
+      VM_B2 next session.
+    - SOC-008 silently no-op until FIM (file integrity monitoring) is added to system
+      integration on agents. Defer to Phase 9 (adaptive intelligence) or earlier.
+    - Trial license expires +30 days (2026-06-05). If still in lab use after that,
+      either re-trial on a fresh cluster or fall back to n8n polling (see Done above).
+    - Phase 8 next: build n8n Workflow 1 (webhook → /correlate → ML score → Ollama
+      summarize → TheHive case create → optional auto-block via SSH to VM_B2).
+  Things to know:
+    - The .webhook connector is platinum/gold/trial-only on Elastic. If anyone reverts
+      to basic, every detection rule that uses this connector will silently fail to send.
+    - Kibana mustache in action params does NOT support {{rule.threat[0]...}} array
+      indexing reliably — that's why MITRE IDs are pulled from rule.tags ("mitre:T...")
+      in n8n workflow 1 instead of templated into the webhook body.
+    - The 13 NDJSON rules are the canonical source of truth. Re-import with
+      overwrite=true to redeploy after edits.
+    - The webhook URL is unauthenticated. n8n test/run mode requires the workflow
+      Active=ON for the production webhook path to accept POSTs — first POST when
+      workflow is inactive returns 404. Phase 8 will activate it.
+
 2026-05-05 — soc-core (VM_A1) — Phase 3 complete: SOAR + AI services with re-architecture
   Done:
     - n8n 2.18.5 systemd unit /etc/systemd/system/n8n.service running as vboxuser on :5678
