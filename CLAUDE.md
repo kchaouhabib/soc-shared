@@ -753,8 +753,9 @@ phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive 
 phase_5_vm_b2_victim_lab:             complete       # Apache+PHP8.5+MariaDB up; DVWA at /dvwa; vsftpd:21 + ssh:22 + 3 weak users; Suricata 8.0.3 with 49911 ET Open rules; Elastic Agent enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45) HEALTHY; integrations attached on VM_A1 Kibana: system-2 + apache-victim-lab (/var/log/apache2/access_soc.log+access.log+error.log) + suricata-victim-lab (/var/log/suricata/eve.json) + vsftpd-victim-lab (Custom Logs /var/log/vsftpd.log → dataset 'vsftpd'). Used native Suricata + Apache integrations (NOT Custom Logs) — pre-parsed/ECS/dashboards. Suricata index growing live (~58k+ docs at attach time). DEFERRED until VM_A1 phase 3: MITRE Tagger /scan/suricata in cron, /refresh from classification.config
 phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
 phase_7_detection_layer_activation:   complete       # 1644 Elastic prebuilt rules installed; ES license trial-activated for .webhook connector; n8n webhook connector id 7c351a6c-4de6-4c07-8146-fa337033c735 (POST → http://192.168.1.50:5678/webhook/elastic-alert); 13 SOC custom rules (SOC-001..SOC-013) imported from ~/soc-project/kibana/soc-rules.ndjson and enabled, all with native MITRE threat[] tagging, webhook action, meta.auto_block flag (true on 002/004/006/009/011); SOC-008 partial-failure benign (FIM indices not yet present); Suricata/Apache rules waiting on VM_B2 to come back online
-phase_8_soar_integration:             complete-with-deferred-thehive  # n8n owner set up via UI; public API key issued (stored in ~/soc-project/.env.local as N8N_API_KEY); N8N_SECURE_COOKIE=false added to /etc/systemd/system/n8n.service for plain-HTTP UI access; 3 n8n credentials created via /api/v1/credentials (httpBasicAuth Elasticsearch=cTJMkUYUxWVtlD8K, httpHeaderAuth TheHive=Ux32rgVuHoXKc1GY [bearer placeholder until VM_B1 boots], sshPrivateKey VM_B2 soc-response=VqpfYno0QpnoseF6 with newly-generated ed25519 keypair at ~/.ssh/soc_response[.pub]); Workflow 1 (id dKSF2AU9E3k9i25p) imported from ~/soc-project/n8n/workflows/01-alert-pipeline.json — 19 nodes ACTIVE on http://192.168.1.50:5678/webhook/elastic-alert; smoke test (exec id=5) verified end-to-end: Webhook → ES (auth fixed: predefinedCredentialType→genericCredentialType+genericAuthType) → Kibana → Set canonical → /correlate (action=create_new bucket=7) → Switch → ML /score (anomaly=0.6445 is_anomaly=True) → Append → Ollama (timeout 600s, num_predict 80) → fails at TheHive create case as expected because VM_B1 offline. DEFERRED until VM_B1+B2 boot: replace placeholder TheHive bearer (n8n_manage_credentials update id=Ux32rgVuHoXKc1GY); install soc_response.pub on VM_B2 (~/.ssh/authorized_keys for soc-response user) + sudoers NOPASSWD for /sbin/iptables; full create_new+TheHive case roundtrip; auto_block path SSH→iptables.
-phase_9_adaptive_intelligence:        pending
+phase_8_soar_integration:             complete-with-deferred-thehive  # n8n owner set up via UI; public API key issued (stored in ~/soc-project/.env.local as N8N_API_KEY); N8N_SECURE_COOKIE=false added to /etc/systemd/system/n8n.service for plain-HTTP UI access; 4 n8n credentials created via /api/v1/credentials (httpBasicAuth Elasticsearch=cTJMkUYUxWVtlD8K, httpHeaderAuth TheHive=Ux32rgVuHoXKc1GY [bearer placeholder], httpHeaderAuth Cortex=HK1qH743oIbnpSbk [bearer placeholder], sshPrivateKey VM_B2 soc-response=VqpfYno0QpnoseF6 with ed25519 keypair at ~/.ssh/soc_response[.pub]); WF1 (id dKSF2AU9E3k9i25p, 19 nodes) ACTIVE on http://192.168.1.50:5678/webhook/elastic-alert — smoke test verified end-to-end through ML+Ollama, fails only at TheHive create (B1 offline); WF2 (id HYiSFNStG5zEG6ZA, 11 nodes) ACTIVE on http://192.168.1.50:5678/webhook/thehive — fire-and-forget Cortex enrichment.
+phase_9_adaptive_intelligence:        complete-with-deferred-thehive  # WF3 (id Z1VpjJlhg2Skek1B, 7 nodes) daily digest cron 0 8 * * * Africa/Tunis — fetches /correlate state, Ollama summary, TheHive digest case, /close buckets; WF4 (id SbXmkucPC24njKwb, 8 nodes) MISP→AI rule gen webhook /webhook/misp — extract indicators, Ollama format:json drafts Kibana detection rule, validates+assembles NDJSON, imports via /api/detection_engine/rules/_import, logs to TheHive (success or failure branch); WF5 (id ekXEZb2PYaxQt7vv, 8 nodes) weekly maintenance cron 0 4 * * 1 — POST /5000/train, parallel health probes (ML/Correlation/ES/alerts count 7d), build summary, TheHive maintenance case. All 3 ACTIVE. WF4 has known caveat: 400-token Ollama JSON output ~22min on CPU-only at 0.3 tok/s vs 600s timeout, often returns empty → workflow correctly routes to log-failure branch. WF3+WF5 final TheHive POST blocked by B1 offline. ML /train probe returned ok:true source:synthetic:1000 — works; will switch to "real:N" once 30d real signals accumulate.
+phase_10_testing:                     pending
 phase_10_testing:                     pending
 phase_11_documentation:               pending
 
@@ -770,6 +771,61 @@ updated_by: soc-core (VM_A1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-06 — soc-core (VM_A1) — Phase 8 (WF2) + Phase 9 (WF3,WF4,WF5) complete + status report
+  Done:
+    - Created Cortex Bearer credential (id HK1qH743oIbnpSbk, type httpHeaderAuth,
+      placeholder bearer until VM_B1 boots).
+    - Authored, imported, activated 4 more workflows via n8n public API:
+        WF2 02-cortex-enrichment.json     id HYiSFNStG5zEG6ZA  webhook /webhook/thehive
+        WF3 03-daily-digest.json          id Z1VpjJlhg2Skek1B  cron 0 8 * * *
+        WF4 04-misp-rule-gen.json         id SbXmkucPC24njKwb  webhook /webhook/misp
+        WF5 05-weekly-maintenance.json    id ekXEZb2PYaxQt7vv  cron 0 4 * * 1
+      All four files in ~/soc-project/n8n/workflows/. All ACTIVE per
+      GET /api/v1/workflows. All 3 webhook URLs respond HTTP 200.
+    - Smoke tests:
+        WF4 — synthetic MISP payload triggered the workflow. Webhook → Extract
+              indicators (IPs/URLs/hashes) → Ollama format:json → after 600s
+              timeout returned empty → Validate detected ok:false → IF routed
+              correctly to "log generation failure" → fails at TheHive POST
+              (B1 offline). Pipeline logic correct; CPU-only Ollama needs
+              ~22 min for 400-token JSON, exceeding 10-min timeout. Workflow
+              gracefully handles failure case.
+        ML /train { days: 1 } — direct probe returned { ok: true,
+              source: "synthetic:1000", trained_at: 1778078256 }. WF5's first
+              step works.
+    - Authored ~/pfe/docs/08-phase8-soar-integration.md and
+      ~/pfe/docs/09-phase9-adaptive-intelligence.md following the same
+      structure as the other phase docs (Objective / Components built / Decisions
+      / Verification / Known gaps / Where this fits).
+    - Authored ~/pfe/docs/REPORT.md — single-page status: TL;DR, phase status,
+      what works, what doesn't, manual steps for the user when VMs come back,
+      key file locations, open architectural questions, scoreboard. This is
+      the file to read first.
+    - Updated ~/pfe/docs/README.md index to reference 08, 09, REPORT.md.
+  Pending / known gaps (unchanged from prior entry, restated for clarity):
+    1. ON VM_B1 (TheHive + Cortex + MISP): generate API keys, update n8n
+       credentials Ux32rgVuHoXKc1GY (TheHive) and HK1qH743oIbnpSbk (Cortex).
+    2. ON VM_B2: install ~/.ssh/soc_response.pub for soc-response user +
+       /etc/sudoers.d/soc-response for NOPASSWD iptables.
+    3. ON VM_B1: add TheHive notifier → http://192.168.1.50:5678/webhook/thehive
+       (wires WF2). Add MISP server entry → http://192.168.1.50:5678/webhook/misp
+       (wires WF4).
+    4. WF4 Ollama timeout: either drop num_predict to 150 or move Ollama to GPU.
+    5. Phase 10 (end-to-end testing) and Phase 11 (rapport documentation) still
+       pending.
+  Things to know:
+    - All 5 workflows follow the n8n-skill convention: HTTP Request nodes with
+      authentication=genericCredentialType + genericAuthType=httpBasicAuth/Header,
+      SSH node with explicit authentication: privateKey, webhook payloads
+      accessed via $('node').item.json.body.field, Switch by case parameter,
+      IF using 2.2 typeVersion with looseTypeValidation when comparing booleans.
+    - Cron timezone: Africa/Tunis on WF3 and WF5 (project setting).
+    - n8n's saveDataSuccessExecution=all + saveDataErrorExecution=all is on
+      every workflow so executions are inspectable via /api/v1/executions/{id}
+      ?includeData=true for debugging.
+    - WF4 deliberately imports rules with enabled=false — analyst-in-the-loop
+      guardrail against LLM hallucinations producing too-broad queries.
+
 2026-05-06 — soc-core (VM_A1) — Phase 8 complete-with-deferred-thehive: SOAR Workflow 1
   Done:
     - n8n owner account set up via UI (one-time first-run form). Required N8N_SECURE_COOKIE=false
