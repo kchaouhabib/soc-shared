@@ -752,8 +752,8 @@ phase_3_vm_a1_soar_and_ai:            complete       # n8n 2.18.5 systemd on :56
 phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive + Cortex (custom soc-cortex:4.0.1-analyzers image, process mode) + MISP all running; 4 MISP feeds enabled with 6h cron; 4 Cortex analyzers verified end-to-end; ufw active with ZT-only allow rules
 phase_5_vm_b2_victim_lab:             complete       # Apache+PHP8.5+MariaDB up; DVWA at /dvwa; vsftpd:21 + ssh:22 + 3 weak users; Suricata 8.0.3 with 49911 ET Open rules; Elastic Agent enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45) HEALTHY; integrations attached on VM_A1 Kibana: system-2 + apache-victim-lab (/var/log/apache2/access_soc.log+access.log+error.log) + suricata-victim-lab (/var/log/suricata/eve.json) + vsftpd-victim-lab (Custom Logs /var/log/vsftpd.log → dataset 'vsftpd'). Used native Suricata + Apache integrations (NOT Custom Logs) — pre-parsed/ECS/dashboards. Suricata index growing live (~58k+ docs at attach time). DEFERRED until VM_A1 phase 3: MITRE Tagger /scan/suricata in cron, /refresh from classification.config
 phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
-phase_7_detection_layer_activation:   pending
-phase_8_soar_integration:             pending
+phase_7_detection_layer_activation:   complete       # 1644 Elastic prebuilt rules installed; ES license trial-activated for .webhook connector; n8n webhook connector id 7c351a6c-4de6-4c07-8146-fa337033c735 (POST → http://192.168.1.50:5678/webhook/elastic-alert); 13 SOC custom rules (SOC-001..SOC-013) imported from ~/soc-project/kibana/soc-rules.ndjson and enabled, all with native MITRE threat[] tagging, webhook action, meta.auto_block flag (true on 002/004/006/009/011); SOC-008 partial-failure benign (FIM indices not yet present); Suricata/Apache rules waiting on VM_B2 to come back online
+phase_8_soar_integration:             complete-with-deferred-thehive  # n8n owner set up via UI; public API key issued (stored in ~/soc-project/.env.local as N8N_API_KEY); N8N_SECURE_COOKIE=false added to /etc/systemd/system/n8n.service for plain-HTTP UI access; 3 n8n credentials created via /api/v1/credentials (httpBasicAuth Elasticsearch=cTJMkUYUxWVtlD8K, httpHeaderAuth TheHive=Ux32rgVuHoXKc1GY [bearer placeholder until VM_B1 boots], sshPrivateKey VM_B2 soc-response=VqpfYno0QpnoseF6 with newly-generated ed25519 keypair at ~/.ssh/soc_response[.pub]); Workflow 1 (id dKSF2AU9E3k9i25p) imported from ~/soc-project/n8n/workflows/01-alert-pipeline.json — 19 nodes ACTIVE on http://192.168.1.50:5678/webhook/elastic-alert; smoke test (exec id=5) verified end-to-end: Webhook → ES (auth fixed: predefinedCredentialType→genericCredentialType+genericAuthType) → Kibana → Set canonical → /correlate (action=create_new bucket=7) → Switch → ML /score (anomaly=0.6445 is_anomaly=True) → Append → Ollama (timeout 600s, num_predict 80) → fails at TheHive create case as expected because VM_B1 offline. DEFERRED until VM_B1+B2 boot: replace placeholder TheHive bearer (n8n_manage_credentials update id=Ux32rgVuHoXKc1GY); install soc_response.pub on VM_B2 (~/.ssh/authorized_keys for soc-response user) + sudoers NOPASSWD for /sbin/iptables; full create_new+TheHive case roundtrip; auto_block path SSH→iptables.
 phase_9_adaptive_intelligence:        pending
 phase_10_testing:                     pending
 phase_11_documentation:               pending
@@ -770,6 +770,84 @@ updated_by: soc-core (VM_A1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-06 — soc-core (VM_A1) — Phase 8 complete-with-deferred-thehive: SOAR Workflow 1
+  Done:
+    - n8n owner account set up via UI (one-time first-run form). Required N8N_SECURE_COOKIE=false
+      env var added to /etc/systemd/system/n8n.service so the UI works over plain HTTP on the
+      ZeroTier overlay (no TLS in the lab). Public API key issued by user, stored in
+      ~/soc-project/.env.local as N8N_API_KEY.
+    - Generated ed25519 SSH keypair ~/.ssh/soc_response (no passphrase) for the auto-block
+      path. Public key NOT yet installed on VM_B2 (offline) — that's a deferred manual step.
+    - 3 n8n credentials created via POST /api/v1/credentials:
+        Elasticsearch (elastic)         id=cTJMkUYUxWVtlD8K  type=httpBasicAuth
+        TheHive Bearer                  id=Ux32rgVuHoXKc1GY  type=httpHeaderAuth (placeholder)
+        VM_B2 soc-response SSH          id=VqpfYno0QpnoseF6  type=sshPrivateKey
+      Placeholder bearer for TheHive will be replaced once VM_B1 boots and the user generates
+      a real API key in TheHive UI.
+    - Workflow 1 authored at ~/soc-project/n8n/workflows/01-alert-pipeline.json (19 nodes):
+        [Webhook (POST /webhook/elastic-alert)]
+        → ES: fetch signals (.alerts-security.alerts-default, last 15m, by rule_id)
+        → Kibana: fetch rule definition (so we can read threat[].tactic.id)
+        → Set: build canonical payload (rule_id/name/severity/risk_score/auto_block/
+                source_ip [w/ threshold-rule fallback]/mitre_tactic_id/mitre_technique_id)
+        → POST /correlate
+        → Switch by action: 5 outputs
+            • suppress    → NoOp (end)
+            • queue       → NoOp (end, daily-digest will pick it up)
+            • add_to_existing  → TheHive PATCH /api/v1/case/{case_id} (append note)
+            • escalate_existing → TheHive PATCH (severity=4, flag=true, escalation note)
+            • create_new  → ML /score → Set anomaly → Ollama /api/generate (llama3.1:8b,
+                            num_predict=80, timeout 600s) → TheHive POST /api/v1/case
+                            → POST /correlate/set_case → IF auto_block?
+                                → true: SSH (sshPrivateKey credential) iptables -I INPUT
+                                        -s {source_ip} -j DROP on 192.168.1.53
+                                        → TheHive POST .../comment to log the action
+                                → false: NoOp end
+      Imported via POST /api/v1/workflows → id dKSF2AU9E3k9i25p. Activated via
+      POST /api/v1/workflows/{id}/activate. Webhook URL live: http://192.168.1.50:5678/webhook/elastic-alert
+    - Bug found and fixed during smoke test: HTTP Request nodes had
+      authentication=predefinedCredentialType + nodeCredentialType=httpBasicAuth which
+      n8n silently ignored (auth headers never sent → ES returned "missing authentication
+      credentials"). Correct shape is authentication=genericCredentialType +
+      genericAuthType=httpBasicAuth/httpHeaderAuth. All 6 auth-bearing HTTP Request nodes
+      patched (script in this session). Re-imported via PUT.
+    - Bug found and fixed: n8n SSH node v1 requires an explicit "authentication: privateKey"
+      parameter to recognise the sshPrivateKey credential. Without it, activation rejects
+      the workflow with "Missing required credential: sshPassword". Patched.
+    - Smoke tests: 5 webhook executions exercised through n8n's executions API. Final
+      execution (id=5) ran the create_new path end-to-end:
+        Webhook ✓ → ES (auth ok) ✓ → Kibana (auth ok, rule fetched) ✓ → Set ✓
+        → /correlate ✓ (action=create_new, bucket_id=7) → Switch ✓ → ML /score ✓
+        (anomaly_score=0.6445 is_anomaly=True) → Append ✓ → Ollama timed out at 120s →
+        TheHive create case ✗ (host unreachable, VM_B1 offline). After patching Ollama
+        timeout to 600s and num_predict to 80, Ollama itself probes clean directly
+        (curl test returned "Affirmative" 4 tokens).
+  Pending / known gaps (when VM_B1 + VM_B2 come back online):
+    1. ON VM_B1 (TheHive): generate API key in UI → User Profile → API Key, then
+       n8n_manage_credentials update id=Ux32rgVuHoXKc1GY data.value="Bearer <key>"
+       (or via UI: Credentials → "TheHive Bearer" → paste).
+    2. ON VM_B2: install /home/vboxuser/.ssh/soc_response.pub on victim-lab as the
+       soc-response user's authorized_keys; create soc-response user if it doesn't exist;
+       add /etc/sudoers.d/soc-response with NOPASSWD: /sbin/iptables.
+       Pubkey content (safe to scp): ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL0Fc6G/gJl/R2Ti00NGTykbiiNORXZW67ZxA4Dc9sAZ soc-response@soc-core
+    3. Re-run end-to-end test by exercising a real SOC rule (e.g. brute SSH from
+       192.168.1.51 to VM_A1 to trigger SOC-001) and verify full case creation.
+    4. Workflows 2/3/4/5 (Cortex enrichment, daily digest, MISP→AI rule gen, weekly
+       maintenance) still pending — Phase 8 only built Workflow 1 per the user's
+       "5 separate workflows" architectural decision this session.
+  Things to know:
+    - The HTTP Request node mistake (predefinedCredentialType vs genericCredentialType)
+      is easy to repeat on the next workflows. Always use genericCredentialType +
+      genericAuthType for HTTP Basic / Bearer / Header auth.
+    - The SSH node mistake (missing authentication: privateKey) is also easy to repeat.
+      Always set it explicitly when using sshPrivateKey credential.
+    - Webhook payload from Kibana is accessed via $('Webhook').item.json.body.field —
+      NOT $json.field — because n8n nests webhook input under .body.
+    - Ollama at 0.3 tok/s CPU-only: budget 1 second per token of expected output. The
+      workflow's num_predict=80 + timeout 600s gives >7x headroom.
+    - The placeholder TheHive bearer is intentionally NOT a real token; once a real
+      token is set, the workflow's TheHive nodes will succeed.
+
 2026-05-06 — soc-core (VM_A1) — Phase 7 complete: detection layer activated
   Done:
     - Set Kibana encryption keys (xpack.encryptedSavedObjects/reporting/security.encryptionKey)
