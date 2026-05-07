@@ -750,7 +750,7 @@ phase_1_zerotier:                     complete       # VM_A1 .50 (node 785fd1806
 phase_2_vm_a1_siem_core:              complete       # ES 8.19.14 single-node (heap dropped 4G→2G in phase 3 to fit Ollama; backup at heap.options.bak-20260505), Kibana 8.19.14, Logstash 8.19.14 (beats:5044, syslog:5140 → ES), Elastic Agent + Fleet Server 8.19.14 on :8220 enrolled in fleet-server-policy. ufw active with allow from 192.168.1.0/24. SOC-Core OS is Ubuntu 26.04 LTS (matches VM_B1, plan said 22.04).
 phase_3_vm_a1_soar_and_ai:            complete       # n8n 2.18.5 systemd on :5678; Ollama 0.22.1 + llama3.1:8b warm with KEEP_ALIVE=24h (cold load ~5min, ~0.3 tok/s CPU-only); 8G swap added. RE-ARCHITECTED: only 2/4 Flask APIs built — ML Anomaly :5000 (IsolationForest, /train pulls .alerts-security.alerts-default), Correlation Engine :5002 (SQLite, 30-min bucket / 2h kill-chain windows; 6 actions verified). DROPPED: NLP API (replaced by n8n→Ollama directly via HTTP node) and MITRE Auto-Tagger (replaced by Kibana's built-in threat[] field at rule definition + Sigma tags + community classtype JSONs). systemd units for ml-api + correlation-engine; /opt/<svc> symlinks back to ~/soc-project/<svc>.
 phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive + Cortex (custom soc-cortex:4.0.1-analyzers image, process mode) + MISP all running; 4 MISP feeds enabled with 6h cron; 4 Cortex analyzers verified end-to-end; ufw active with ZT-only allow rules
-phase_5_vm_b2_victim_lab:             complete       # Apache+PHP8.5+MariaDB up; DVWA at /dvwa; vsftpd:21 + ssh:22 + 3 weak users; Suricata 8.0.3 with 49911 ET Open rules; Elastic Agent enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45) HEALTHY; integrations attached on VM_A1 Kibana: system-2 + apache-victim-lab (/var/log/apache2/access_soc.log+access.log+error.log) + suricata-victim-lab (/var/log/suricata/eve.json) + vsftpd-victim-lab (Custom Logs /var/log/vsftpd.log → dataset 'vsftpd'). Used native Suricata + Apache integrations (NOT Custom Logs) — pre-parsed/ECS/dashboards. Suricata index growing live (~58k+ docs at attach time). DEFERRED until VM_A1 phase 3: MITRE Tagger /scan/suricata in cron, /refresh from classification.config
+phase_5_vm_b2_victim_lab:             complete       # Apache+PHP8.5+MariaDB up; DVWA at /dvwa; vsftpd:21 + ssh:22 + 3 weak users; Suricata 8.0.3 with 49911 ET Open rules; Elastic Agent enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45) HEALTHY; integrations attached on VM_A1 Kibana: system-2 + apache-victim-lab (/var/log/apache2/access_soc.log+access.log+error.log) + suricata-victim-lab (/var/log/suricata/eve.json) + vsftpd-victim-lab (Custom Logs /var/log/vsftpd.log → dataset 'vsftpd'). Used native Suricata + Apache integrations (NOT Custom Logs) — pre-parsed/ECS/dashboards. Suricata index growing live (~58k+ docs at attach time). Active-response wired 2026-05-07: soc-response user (uid 1004, password locked) with VM_A1's ed25519 pubkey in /home/soc-response/.ssh/authorized_keys + /etc/sudoers.d/soc-response NOPASSWD for both /sbin/iptables and /usr/sbin/iptables; verified end-to-end by Phase 10 SQLi test (WF1 SSH+iptables rc=0). OBSOLETE: original "MITRE Tagger /scan/suricata cron + /refresh from classification.config" deferred items dropped in Phase 3 re-architecture (Kibana threat[] + Sigma attack.t#### + community classtype JSONs replace it).
 phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
 phase_7_detection_layer_activation:   complete       # 1644 Elastic prebuilt rules installed; ES license trial-activated for .webhook connector; n8n webhook connector id 7c351a6c-4de6-4c07-8146-fa337033c735 (POST → http://192.168.1.50:5678/webhook/elastic-alert); 13 SOC custom rules (SOC-001..SOC-013) imported from ~/soc-project/kibana/soc-rules.ndjson and enabled, all with native MITRE threat[] tagging, webhook action, meta.auto_block flag (true on 002/004/006/009/011); SOC-008 partial-failure benign (FIM indices not yet present); Suricata/Apache rules waiting on VM_B2 to come back online
 phase_8_soar_integration:             complete       # WF1+WF2 ACTIVE; B1 wiring done 2026-05-07: real bearers minted (TheHive=rtHZuTw01P0UwaeDKmcT04bBQZmxvlGM for soc-bot@thehive.local in new SOC-LAB org [analyst profile]; Cortex=existing cortex-user key 6MWnt7E3FdH0muqjoG6Xyd+5msDQf4S2 reused). VM_A1 owner pastes bearers into n8n UI for cred ids Ux32rgVuHoXKc1GY / HK1qH743oIbnpSbk (n8n public API has no PATCH for creds; UI edit keeps id stable). TheHive→WF2 wired via polling bridge (~/soc-project/thehive-cortex/cron-cases-to-wf2.sh, every 1m) — TheHive 5.7.1 native notification.endpoints+items config accepts the rule but actor never dispatches; bridge posts Case JSON in TheHive's native envelope shape ({operation,objectType,objectId,object}) directly to /webhook/thehive. Smoke verified case=~32880 wf2=200.
@@ -759,7 +759,7 @@ phase_10_testing:                     in-progress    # 2026-05-07: full end-to-e
 phase_11_documentation:               pending
 
 last_updated: 2026-05-07
-updated_by: soc-core (VM_A1)
+updated_by: victim-lab (VM_B2)
 ```
 
 ---
@@ -770,6 +770,52 @@ updated_by: soc-core (VM_A1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-07 (latest) — victim-lab (VM_B2) — Active-response wired + post-test cleanup
+  Done:
+    - Created soc-response user (uid 1004, gid 1004, /home/soc-response,
+      /bin/bash, GECOS "SOC active-response (n8n auto-block)"). passwd -l
+      to lock the password — SSH key auth is the only login path.
+    - Installed VM_A1's ed25519 public key (ssh-ed25519 AAAAC3...sAZ
+      soc-response@soc-core) into /home/soc-response/.ssh/authorized_keys
+      (mode 600, owner soc-response). .ssh dir is 700.
+    - Created /etc/sudoers.d/soc-response (mode 440, owner root) with
+      `soc-response ALL=(root) NOPASSWD: /usr/sbin/iptables, /sbin/iptables`.
+      Validated with `visudo -cf` before move. Both paths are listed
+      because sudo policy matches the literal command path the caller
+      typed; on this Ubuntu both symlink to /etc/alternatives/iptables →
+      /usr/sbin/xtables-nft-multi but n8n's WF1 SSH node may invoke either.
+    - Local sanity test passed: `sudo -u soc-response sudo -n
+      /usr/sbin/iptables -L INPUT -n` and the /sbin variant both succeed
+      without prompting.
+    - Cleared the iptables DROP -s 192.168.1.50 -j DROP rule that VM_A1's
+      Phase 10 SQLi attack had auto-installed (rule that proved the
+      auto-block path works end-to-end). VM_A1 reachable again from B2
+      (~9-26ms over ZeroTier).
+    - Updated phase_5 status line: appended the active-response wiring,
+      removed the now-obsolete "DEFERRED until VM_A1 phase 3 MITRE Tagger"
+      tail (Phase 3 re-architecture dropped that whole approach).
+  Pending / known gaps:
+    - SSH-based rules SOC-001/002 remain partially blind to OpenSSH 9.x
+      brute-force because PerSourcePenalties drops repeated auth attempts
+      with a "penalty: failed authentication" message that doesn't map to
+      event.outcome:"failure" via the system integration. Three options
+      noted in VM_A1's Phase 10 entry; if the rapport demo wants those
+      rules to fire, easiest is `PerSourcePenalties no` in
+      /etc/ssh/sshd_config on this VM.
+    - Phase 10 itself stays in-progress on VM_A1 until they declare it
+      done; nothing more for B2 until Phase 11 (rapport docs).
+  Things to know:
+    - Public key is non-secret. Private half stays on VM_A1 only
+      (~/.ssh/soc_response, no passphrase, used by n8n cred id
+      VqpfYno0QpnoseF6).
+    - If someone needs to revoke the auto-block path: remove
+      /etc/sudoers.d/soc-response (or replace authorized_keys).
+      User stays usable for any future expansion.
+    - When WF1's auto-block fires it leaves an INPUT DROP rule that
+      survives reboot only if iptables-persistent is installed (not on
+      this VM). For lab purposes the rule is in-memory only — ok for
+      demo runs.
+
 2026-05-07 (later) — soc-core (VM_A1) — Phase 10 first full green end-to-end run
   Done:
     - Patched the two n8n credentials via `PATCH /api/v1/credentials/{id}` —
