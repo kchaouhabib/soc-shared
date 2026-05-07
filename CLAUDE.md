@@ -753,14 +753,13 @@ phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive 
 phase_5_vm_b2_victim_lab:             complete       # Apache+PHP8.5+MariaDB up; DVWA at /dvwa; vsftpd:21 + ssh:22 + 3 weak users; Suricata 8.0.3 with 49911 ET Open rules; Elastic Agent enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45) HEALTHY; integrations attached on VM_A1 Kibana: system-2 + apache-victim-lab (/var/log/apache2/access_soc.log+access.log+error.log) + suricata-victim-lab (/var/log/suricata/eve.json) + vsftpd-victim-lab (Custom Logs /var/log/vsftpd.log → dataset 'vsftpd'). Used native Suricata + Apache integrations (NOT Custom Logs) — pre-parsed/ECS/dashboards. Suricata index growing live (~58k+ docs at attach time). DEFERRED until VM_A1 phase 3: MITRE Tagger /scan/suricata in cron, /refresh from classification.config
 phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
 phase_7_detection_layer_activation:   complete       # 1644 Elastic prebuilt rules installed; ES license trial-activated for .webhook connector; n8n webhook connector id 7c351a6c-4de6-4c07-8146-fa337033c735 (POST → http://192.168.1.50:5678/webhook/elastic-alert); 13 SOC custom rules (SOC-001..SOC-013) imported from ~/soc-project/kibana/soc-rules.ndjson and enabled, all with native MITRE threat[] tagging, webhook action, meta.auto_block flag (true on 002/004/006/009/011); SOC-008 partial-failure benign (FIM indices not yet present); Suricata/Apache rules waiting on VM_B2 to come back online
-phase_8_soar_integration:             complete-with-deferred-thehive  # n8n owner set up via UI; public API key issued (stored in ~/soc-project/.env.local as N8N_API_KEY); N8N_SECURE_COOKIE=false added to /etc/systemd/system/n8n.service for plain-HTTP UI access; 4 n8n credentials created via /api/v1/credentials (httpBasicAuth Elasticsearch=cTJMkUYUxWVtlD8K, httpHeaderAuth TheHive=Ux32rgVuHoXKc1GY [bearer placeholder], httpHeaderAuth Cortex=HK1qH743oIbnpSbk [bearer placeholder], sshPrivateKey VM_B2 soc-response=VqpfYno0QpnoseF6 with ed25519 keypair at ~/.ssh/soc_response[.pub]); WF1 (id dKSF2AU9E3k9i25p, 19 nodes) ACTIVE on http://192.168.1.50:5678/webhook/elastic-alert — smoke test verified end-to-end through ML+Ollama, fails only at TheHive create (B1 offline); WF2 (id HYiSFNStG5zEG6ZA, 11 nodes) ACTIVE on http://192.168.1.50:5678/webhook/thehive — fire-and-forget Cortex enrichment.
-phase_9_adaptive_intelligence:        complete-with-deferred-thehive  # WF3 (id Z1VpjJlhg2Skek1B, 7 nodes) daily digest cron 0 8 * * * Africa/Tunis — fetches /correlate state, Ollama summary, TheHive digest case, /close buckets; WF4 (id SbXmkucPC24njKwb, 8 nodes) MISP→AI rule gen webhook /webhook/misp — extract indicators, Ollama format:json drafts Kibana detection rule, validates+assembles NDJSON, imports via /api/detection_engine/rules/_import, logs to TheHive (success or failure branch); WF5 (id ekXEZb2PYaxQt7vv, 8 nodes) weekly maintenance cron 0 4 * * 1 — POST /5000/train, parallel health probes (ML/Correlation/ES/alerts count 7d), build summary, TheHive maintenance case. All 3 ACTIVE. WF4 has known caveat: 400-token Ollama JSON output ~22min on CPU-only at 0.3 tok/s vs 600s timeout, often returns empty → workflow correctly routes to log-failure branch. WF3+WF5 final TheHive POST blocked by B1 offline. ML /train probe returned ok:true source:synthetic:1000 — works; will switch to "real:N" once 30d real signals accumulate.
-phase_10_testing:                     pending
+phase_8_soar_integration:             complete       # WF1+WF2 ACTIVE; B1 wiring done 2026-05-07: real bearers minted (TheHive=rtHZuTw01P0UwaeDKmcT04bBQZmxvlGM for soc-bot@thehive.local in new SOC-LAB org [analyst profile]; Cortex=existing cortex-user key 6MWnt7E3FdH0muqjoG6Xyd+5msDQf4S2 reused). VM_A1 owner pastes bearers into n8n UI for cred ids Ux32rgVuHoXKc1GY / HK1qH743oIbnpSbk (n8n public API has no PATCH for creds; UI edit keeps id stable). TheHive→WF2 wired via polling bridge (~/soc-project/thehive-cortex/cron-cases-to-wf2.sh, every 1m) — TheHive 5.7.1 native notification.endpoints+items config accepts the rule but actor never dispatches; bridge posts Case JSON in TheHive's native envelope shape ({operation,objectType,objectId,object}) directly to /webhook/thehive. Smoke verified case=~32880 wf2=200.
+phase_9_adaptive_intelligence:        complete       # WF3+WF4+WF5 ACTIVE; MISP→WF4 wired via polling bridge (~/soc-project/misp/cron-publish-to-wf4.sh, every 1m, uses /events/restSearch with publish_timestamp filter — MISP 2.5 has no native single-URL outbound webhook). WF4 Ollama timeout caveat unchanged.
 phase_10_testing:                     pending
 phase_11_documentation:               pending
 
-last_updated: 2026-05-06
-updated_by: soc-core (VM_A1)
+last_updated: 2026-05-07
+updated_by: incident-mgmt (VM_B1)
 ```
 
 ---
@@ -771,6 +770,91 @@ updated_by: soc-core (VM_A1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-07 — incident-mgmt (VM_B1) — Phase 8/9 wiring on B1 done; both VMs now wired
+  Done:
+    - Recovered Cassandra: corrupt commit-log segment from Apr 30 22:21
+      (CommitLog-7-1777587684535.log, paired _536) blocked startup with
+      "Could not read commit log descriptor". Moved both segments to
+      /tmp/cassandra-bad-commitlogs-20260507/ (lab — no in-flight data
+      depended on those Apr 30 writes; SSTables hold all real data).
+      Cassandra now healthy on 9042, TheHive joined cleanly.
+    - TheHive: created SOC-LAB organisation, two new users:
+        soc-bot@thehive.local      profile=analyst   (case-create bearer for n8n WF1)
+        socadmin@thehive.local     profile=org-admin (manages SOC-LAB org config)
+      API keys (in ~/soc-project/.env.local on B1):
+        THEHIVE_BOT_API_KEY=rtHZuTw01P0UwaeDKmcT04bBQZmxvlGM
+        SOCADMIN_KEY=qr5vp1AdFOaEUzWt8E6Qj5R7F2QQg4V/   (operational, not committed)
+    - Cortex: reused existing cortex-user bearer for n8n cred (already in
+      .env.local as CORTEX_USER_API_KEY=6MWnt7E3FdH0muqjoG6Xyd+5msDQf4S2).
+      Same key TheHive uses via TH_CORTEX_KEYS — fine for a lab.
+    - Handed both bearers to VM_A1 owner for UI paste into n8n cred ids
+      Ux32rgVuHoXKc1GY (TheHive) and HK1qH743oIbnpSbk (Cortex). UI edit
+      keeps id stable; n8n public API exposes no PATCH/PUT for creds.
+    - TheHive notifier (org-level): tried the native notification framework
+      via static config.
+        - Endpoint registered at system level via bind-mounted partial
+          /etc/thehive/application.conf:
+            notification.endpoints = [{name="n8n-soc", type="webhook",
+              url="http://192.168.1.50:5678/webhook/thehive", ...}]
+          Confirmed visible in /api/config after restart.
+        - Org-level rule persisted via PUT /api/v1/config/organisation/notification
+          under socadmin (org-admin in SOC-LAB):
+            {value:{endpoints:[...], items:[{trigger:{name:"AnyEvent"},
+                                            endpoint:"n8n-soc",
+                                            filter:{}, enabled:true,
+                                            delegate:true}]}}
+        - But: NotificationActor logs "Starting fixed thread pool with 2
+          threads" at boot and then never emits anything on case create.
+          Tried trigger names AnyEvent, CaseCreated; tried both shapes
+          (rules-as-array vs rules-inside-{endpoints,items}); all silent.
+          Audit records ARE created (verified via listAudit query) and the
+          webhook URL IS reachable from inside the container (curl 200).
+          Time-to-fix > value. Documented and moved on.
+    - Workaround: polling bridge (~/soc-project/thehive-cortex/cron-cases-to-wf2.sh)
+      runs every minute, queries listCase filter _gt _createdAt, posts each
+      new case in TheHive's native notifier envelope shape
+      ({operation:"create", objectType:"Case", objectId, object:<full case>})
+      to http://192.168.1.50:5678/webhook/thehive. Verified end-to-end:
+      case=~32880 wf2=200. Same pattern as MISP→WF4.
+    - MISP→WF4 (Phase 9 deferred): polling bridge
+      ~/soc-project/misp/cron-publish-to-wf4.sh, every minute, uses
+      /events/restSearch with publish_timestamp filter and sends matching
+      Event JSONs to /webhook/misp. First-run seeds state to "now" (avoids
+      backfilling 1606 historical feed events into WF4). MISP 2.5 has no
+      native single-URL outbound webhook, only ZeroMQ/email — bridge is
+      simpler and survives restarts cleanly.
+    - Bind-mount ./thehive/conf/application.conf → /etc/thehive/application.conf
+      added to docker-compose.yml so the notifier endpoint config persists
+      across container recreates.
+    - Cron now has 3 jobs:
+        */6h MISP feed fetch
+        every-1m MISP→WF4 bridge
+        every-1m TheHive→WF2 bridge
+  Pending / known gaps:
+    - VM_A1 owner: paste the two bearers into n8n UI (cred ids
+      Ux32rgVuHoXKc1GY, HK1qH743oIbnpSbk), save. After that, re-fire WF1
+      smoke from A1 — it should now succeed at the TheHive case-create
+      step (case lands in SOC-LAB, then bridge picks it up within 60s and
+      fires WF2 enrichment).
+    - VM_B2: still need to install ~/.ssh/soc_response.pub for soc-response
+      user + /etc/sudoers.d/soc-response (NOPASSWD iptables) so WF1's
+      auto_block path works.
+    - TheHive native notifier: not chasing further. If it ever starts
+      working (TheHive update, config tweak, etc.), the bridge will
+      coexist harmlessly — WF2 is idempotent on duplicate POSTs (n8n
+      executions are independent).
+    - Phase 10 (end-to-end testing) and Phase 11 (rapport) still pending.
+  Things to know:
+    - The notifier bridge timestamp uses ms epoch ($(date +%s)*1000) —
+      matches TheHive's _createdAt field. `date +%s%3N` returned wrong
+      output on this Ubuntu (full nanos not truncated to 3 digits).
+    - SOC-LAB org now exists in TheHive. WF1's TheHive case-create node
+      should NOT need an X-Organisation header since soc-bot's
+      defaultOrganisation=SOC-LAB. If it sets one explicitly, it must be
+      "SOC-LAB" exactly.
+    - Don't run socadmin's API key from WF1 — it has org-admin perms; use
+      THEHIVE_BOT_API_KEY (analyst) for n8n's case-create flow.
+
 2026-05-06 — soc-core (VM_A1) — Phase 8 (WF2) + Phase 9 (WF3,WF4,WF5) complete + status report
   Done:
     - Created Cortex Bearer credential (id HK1qH743oIbnpSbk, type httpHeaderAuth,
