@@ -755,11 +755,11 @@ phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 
 phase_7_detection_layer_activation:   complete       # 1644 Elastic prebuilt rules installed; ES license trial-activated for .webhook connector; n8n webhook connector id 7c351a6c-4de6-4c07-8146-fa337033c735 (POST → http://192.168.1.50:5678/webhook/elastic-alert); 13 SOC custom rules (SOC-001..SOC-013) imported from ~/soc-project/kibana/soc-rules.ndjson and enabled, all with native MITRE threat[] tagging, webhook action, meta.auto_block flag (true on 002/004/006/009/011); SOC-008 partial-failure benign (FIM indices not yet present); Suricata/Apache rules waiting on VM_B2 to come back online
 phase_8_soar_integration:             complete       # WF1+WF2 ACTIVE; B1 wiring done 2026-05-07: real bearers minted (TheHive=rtHZuTw01P0UwaeDKmcT04bBQZmxvlGM for soc-bot@thehive.local in new SOC-LAB org [analyst profile]; Cortex=existing cortex-user key 6MWnt7E3FdH0muqjoG6Xyd+5msDQf4S2 reused). VM_A1 owner pastes bearers into n8n UI for cred ids Ux32rgVuHoXKc1GY / HK1qH743oIbnpSbk (n8n public API has no PATCH for creds; UI edit keeps id stable). TheHive→WF2 wired via polling bridge (~/soc-project/thehive-cortex/cron-cases-to-wf2.sh, every 1m) — TheHive 5.7.1 native notification.endpoints+items config accepts the rule but actor never dispatches; bridge posts Case JSON in TheHive's native envelope shape ({operation,objectType,objectId,object}) directly to /webhook/thehive. Smoke verified case=~32880 wf2=200.
 phase_9_adaptive_intelligence:        complete       # WF3+WF4+WF5 ACTIVE; MISP→WF4 wired via polling bridge (~/soc-project/misp/cron-publish-to-wf4.sh, every 1m, uses /events/restSearch with publish_timestamp filter — MISP 2.5 has no native single-URL outbound webhook). WF4 Ollama timeout caveat unchanged.
-phase_10_testing:                     pending
+phase_10_testing:                     in-progress    # 2026-05-07: full end-to-end pipeline verified — SOC-004 SQLi attack from VM_A1 → Apache log → ES → SOC-004 rule fires → webhook → WF1 (14 nodes) → ML score 0.6335 → Ollama summary (200s) → TheHive case ~40984800 number 11 in SOC-LAB org with full MITRE/anomaly metadata → SSH iptables block on VM_B2 succeeded → TheHive auto-block comment posted → bridge picked up case 60s later → WF2 fired Cortex enrichment exec 24. Auto-block confirmed by losing connectivity to VM_B2 from A1.
 phase_11_documentation:               pending
 
 last_updated: 2026-05-07
-updated_by: incident-mgmt (VM_B1)
+updated_by: soc-core (VM_A1)
 ```
 
 ---
@@ -770,6 +770,96 @@ updated_by: incident-mgmt (VM_B1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-07 (later) — soc-core (VM_A1) — Phase 10 first full green end-to-end run
+  Done:
+    - Patched the two n8n credentials via `PATCH /api/v1/credentials/{id}` —
+      contradicting B1's note that no PATCH exists. Live n8n on this build
+      DOES expose PATCH. TheHive Bearer (Ux32rgVuHoXKc1GY) and Cortex Bearer
+      (HK1qH743oIbnpSbk) now hold the real soc-bot and cortex-user keys.
+      Direct curl to TheHive case-create with the new bearer returned 201
+      and case ~36896 (verification only).
+    - Patched WF1 Ollama node `num_predict` 80 → 30 via `PUT /workflows/{id}`
+      (had to strip `binaryMode` from settings — public-API schema only
+      accepts a closed set of settings keys).
+    - Pulled gemma3:4b for the model swap experiment. Benchmarked at
+      ~0.47 tok/s warm vs llama's ~0.3 tok/s — not the 3× win the user
+      expected. Decision: skip the model swap, stick with llama3.1:8b plus
+      num_predict=30. gemma3:4b stays on disk for future experimentation.
+    - Discovery #1 (testing): SSH brute force at modern OpenSSH 9.x
+      triggers PerSourcePenalties immediately. The auth.log lines are
+      "drop connection ... penalty: failed authentication", which the
+      Elastic Agent system integration does NOT parse to
+      event.outcome:"failure". Result: SOC-001's KQL won't match this
+      attack pattern as written. Pivoted to SOC-003/004 (HTTP SQLi via
+      Apache integration) which are shape-compatible.
+    - Discovery #2 (testing — root cause of the 3 failed exec rounds 13, 15,
+      17): the action body template on ALL 13 SOC rules used non-existent
+      Mustache variables. `{{rule.rule_id}}`, `{{rule.severity}}`,
+      `{{rule.risk_score}}` don't exist in the SIEM summary action context;
+      they render to empty strings, producing malformed JSON
+      (`"risk_score":,`). That cascaded to ES fetch (term query with empty
+      rule_id → 0 hits), Build canonical (all-null fields), and TheHive
+      create (BadRequest because tags[2] was the empty rule_id).
+      The CORRECT paths are `{{rule.params.ruleId}}`, `{{rule.params.severity}}`,
+      `{{rule.params.riskScore}}`. Bulk-patched all 13 SOC rules via
+      `PATCH /api/detection_engine/rules` with the corrected body and per-rule
+      `auto_block` values from the rule's `meta.auto_block` field. After
+      that, every node downstream got real data.
+    - Closed all phantom buckets in correlation engine (left over from the
+      failed rounds, which had set case_id=~45168 to a non-existent case)
+      via `POST /5002/close` so the next /correlate call would return
+      action=create_new and force fresh TheHive case creation.
+    - Fired 6 fresh SQLi requests (lambda..pi series). SOC-003 rule fired
+      at 23:34:21Z with 12 active alerts and the action succeeded. WF1
+      execution 22 ran all 14 nodes successfully:
+        Webhook → ES → Kibana → Build canonical → /correlate (action:create_new
+        bucket_id:10) → ML score 0.6335 → Ollama summary 200s → TheHive
+        create case ~40984800 number 11 → set_case → IF auto_block(true) →
+        SSH iptables -I INPUT -s 192.168.1.50 -j DROP on victim-lab
+        (return code 0) → TheHive comment "Auto-block executed: …".
+      The case in SOC-LAB org has full payload: severity=HIGH, tags
+      [PFE, SOC-004, SOC-Lab, mitre:T1190, mitre:TA0001], assignee=
+      soc-bot@thehive.local, AI summary in description.
+    - Bridge fired: WF2 (Cortex enrichment) execution 24 at 23:38:01Z —
+      B1's cron-cases-to-wf2.sh polled and posted the new SOC-LAB case to
+      /webhook/thehive within 60s of creation, exactly as designed.
+    - Auto-block confirmed working: VM_B2 became unreachable from this VM
+      immediately after WF1 finished; iptables rule survives on B2.
+  Pending / known gaps:
+    - VM_A1 (this VM) is currently DROP-blocked at VM_B2's iptables.
+      To clear so re-tests can run, on VM_B2 run:
+        sudo /sbin/iptables -D INPUT -s 192.168.1.50 -j DROP
+      The B2 session can do this from its local terminal.
+    - SSH-based rules (SOC-001/002) need either: (a) PerSourcePenalties
+      disabled on B2's sshd (`/etc/ssh/sshd_config: PerSourcePenalties no`),
+      or (b) the rule query updated to also match
+      message:"penalty: failed authentication" lines, or (c) skip them
+      and rely on SOC-003..013 for the rapport demo.
+    - Phase 10 still has Phase 11 to follow (rapport documentation).
+    - WF1 Ollama 200s for 30 tokens on this run (vs 339s previously) —
+      timing is variable but well under the 600s timeout. No more changes
+      needed there.
+  Things to know:
+    - SIEM action variables for `siem.queryRule` summary mode:
+        rule.name        → display name (works)
+        rule.id          → rule UUID (the kibana-internal uuid)
+        rule.tags        → array
+        rule.params.ruleId      → user-defined SOC-NNN
+        rule.params.severity    → low/medium/high/critical
+        rule.params.riskScore   → integer
+        rule.params.threat      → MITRE array (use {{{...}}} triple-stash)
+        context.results_link    → Kibana deep link (use {{{...}}})
+        context.alerts          → JSON-stringified alerts array
+    - n8n public API DOES expose PATCH on credentials and PUT on workflows,
+      contrary to B1's earlier note. PUT requires sanitized `settings`
+      (only the documented keys: executionOrder, saveExecutionProgress,
+      saveDataSuccessExecution, saveDataErrorExecution; binaryMode etc.
+      are rejected as "additional properties").
+    - Correlation engine bucket reset: any time the engine has stale
+      case_id pointers (from earlier failed runs), close them via
+      POST /5002/close {bucket_id:N} or the workflow will silently 404 on
+      the "add to existing case" branch.
+
 2026-05-07 — incident-mgmt (VM_B1) — Phase 8/9 wiring on B1 done; both VMs now wired
   Done:
     - Recovered Cassandra: corrupt commit-log segment from Apr 30 22:21
