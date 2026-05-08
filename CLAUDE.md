@@ -750,7 +750,7 @@ phase_1_zerotier:                     complete       # VM_A1 .50 (node 785fd1806
 phase_2_vm_a1_siem_core:              complete       # ES 8.19.14 single-node (heap dropped 4G→2G in phase 3 to fit Ollama; backup at heap.options.bak-20260505), Kibana 8.19.14, Logstash 8.19.14 (beats:5044, syslog:5140 → ES), Elastic Agent + Fleet Server 8.19.14 on :8220 enrolled in fleet-server-policy. ufw active with allow from 192.168.1.0/24. SOC-Core OS is Ubuntu 26.04 LTS (matches VM_B1, plan said 22.04).
 phase_3_vm_a1_soar_and_ai:            complete       # n8n 2.18.5 systemd on :5678; Ollama 0.22.1 + llama3.1:8b warm with KEEP_ALIVE=24h (cold load ~5min, ~0.3 tok/s CPU-only); 8G swap added. RE-ARCHITECTED: only 2/4 Flask APIs built — ML Anomaly :5000 (IsolationForest, /train pulls .alerts-security.alerts-default), Correlation Engine :5002 (SQLite, 30-min bucket / 2h kill-chain windows; 6 actions verified). DROPPED: NLP API (replaced by n8n→Ollama directly via HTTP node) and MITRE Auto-Tagger (replaced by Kibana's built-in threat[] field at rule definition + Sigma tags + community classtype JSONs). systemd units for ml-api + correlation-engine; /opt/<svc> symlinks back to ~/soc-project/<svc>.
 phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive + Cortex (custom soc-cortex:4.0.1-analyzers image, process mode) + MISP all running; 4 MISP feeds enabled with 6h cron; 4 Cortex analyzers verified end-to-end; ufw active with ZT-only allow rules
-phase_5_vm_b2_victim_lab:             complete       # Apache+PHP8.5+MariaDB up; DVWA at /dvwa; vsftpd:21 + ssh:22 + 3 weak users; Suricata 8.0.3 with 49911 ET Open rules; Elastic Agent enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45) HEALTHY; integrations attached on VM_A1 Kibana: system-2 + apache-victim-lab (/var/log/apache2/access_soc.log+access.log+error.log) + suricata-victim-lab (/var/log/suricata/eve.json) + vsftpd-victim-lab (Custom Logs /var/log/vsftpd.log → dataset 'vsftpd'). Used native Suricata + Apache integrations (NOT Custom Logs) — pre-parsed/ECS/dashboards. Suricata index growing live (~58k+ docs at attach time). Active-response wired 2026-05-07: soc-response user (uid 1004, password locked) with VM_A1's ed25519 pubkey in /home/soc-response/.ssh/authorized_keys + /etc/sudoers.d/soc-response NOPASSWD for both /sbin/iptables and /usr/sbin/iptables; verified end-to-end by Phase 10 SQLi test (WF1 SSH+iptables rc=0). OBSOLETE: original "MITRE Tagger /scan/suricata cron + /refresh from classification.config" deferred items dropped in Phase 3 re-architecture (Kibana threat[] + Sigma attack.t#### + community classtype JSONs replace it).
+phase_5_vm_b2_victim_lab:             complete       # Apache+PHP8.5+MariaDB up; DVWA at /dvwa; vsftpd:21 + ssh:22 + 3 weak users; Suricata 8.0.3 with 49911 ET Open rules; Elastic Agent enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45) HEALTHY; integrations attached on VM_A1 Kibana: system-2 + apache-victim-lab (/var/log/apache2/access_soc.log+access.log+error.log) + suricata-victim-lab (/var/log/suricata/eve.json) + vsftpd-victim-lab (Custom Logs /var/log/vsftpd.log → dataset 'vsftpd'). Used native Suricata + Apache integrations (NOT Custom Logs) — pre-parsed/ECS/dashboards. Suricata index growing live (~58k+ docs at attach time). Active-response wired 2026-05-07: soc-response user (uid 1004, password locked) with VM_A1's ed25519 pubkey in /home/soc-response/.ssh/authorized_keys + /etc/sudoers.d/soc-response NOPASSWD for both /sbin/iptables and /usr/sbin/iptables; verified end-to-end by Phase 10 SQLi test (WF1 SSH+iptables rc=0). SSH brute-force log shape fixed 2026-05-08: PerSourcePenalties no in /etc/ssh/sshd_config.d/99-soc-lab.conf so repeated auth failures emit standard "Failed password" lines instead of OpenSSH 9.x's "penalty: failed authentication" — required for SOC-001/SOC-002 to fire (per VM_A1 Phase 10 note). OBSOLETE: original "MITRE Tagger /scan/suricata cron + /refresh from classification.config" deferred items dropped in Phase 3 re-architecture (Kibana threat[] + Sigma attack.t#### + community classtype JSONs replace it).
 phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
 phase_7_detection_layer_activation:   complete       # 1644 Elastic prebuilt rules installed; ES license trial-activated for .webhook connector; n8n webhook connector id 7c351a6c-4de6-4c07-8146-fa337033c735 (POST → http://192.168.1.50:5678/webhook/elastic-alert); 13 SOC custom rules (SOC-001..SOC-013) imported from ~/soc-project/kibana/soc-rules.ndjson and enabled, all with native MITRE threat[] tagging, webhook action, meta.auto_block flag (true on 002/004/006/009/011); SOC-008 partial-failure benign (FIM indices not yet present); Suricata/Apache rules waiting on VM_B2 to come back online
 phase_8_soar_integration:             complete       # WF1+WF2 ACTIVE; B1 wiring done 2026-05-07: real bearers minted (TheHive=rtHZuTw01P0UwaeDKmcT04bBQZmxvlGM for soc-bot@thehive.local in new SOC-LAB org [analyst profile]; Cortex=existing cortex-user key 6MWnt7E3FdH0muqjoG6Xyd+5msDQf4S2 reused). VM_A1 owner pastes bearers into n8n UI for cred ids Ux32rgVuHoXKc1GY / HK1qH743oIbnpSbk (n8n public API has no PATCH for creds; UI edit keeps id stable). TheHive→WF2 wired via polling bridge (~/soc-project/thehive-cortex/cron-cases-to-wf2.sh, every 1m) — TheHive 5.7.1 native notification.endpoints+items config accepts the rule but actor never dispatches; bridge posts Case JSON in TheHive's native envelope shape ({operation,objectType,objectId,object}) directly to /webhook/thehive. Smoke verified case=~32880 wf2=200.
@@ -758,7 +758,7 @@ phase_9_adaptive_intelligence:        complete       # WF3+WF4+WF5 ACTIVE; MISP�
 phase_10_testing:                     in-progress    # 2026-05-07: full end-to-end pipeline verified — SOC-004 SQLi attack from VM_A1 → Apache log → ES → SOC-004 rule fires → webhook → WF1 (14 nodes) → ML score 0.6335 → Ollama summary (200s) → TheHive case ~40984800 number 11 in SOC-LAB org with full MITRE/anomaly metadata → SSH iptables block on VM_B2 succeeded → TheHive auto-block comment posted → bridge picked up case 60s later → WF2 fired Cortex enrichment exec 24. Auto-block confirmed by losing connectivity to VM_B2 from A1.
 phase_11_documentation:               pending
 
-last_updated: 2026-05-07
+last_updated: 2026-05-08
 updated_by: victim-lab (VM_B2)
 ```
 
@@ -770,6 +770,48 @@ updated_by: victim-lab (VM_B2)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-08 — victim-lab (VM_B2) — SSH brute-force log shape fix (PerSourcePenalties off)
+  Done:
+    - Closed the SOC-001/SOC-002 detection-blind-spot identified in
+      VM_A1's Phase 10 entry. OpenSSH 9.x ships PerSourcePenalties on by
+      default (effective config showed authfail:5, noauth:1, ... before
+      change). Repeated failed-auth attempts caused sshd to "drop
+      connection ... penalty: failed authentication" instead of emitting
+      standard "Failed password" lines, which Elastic's system
+      integration does not parse to event.outcome:"failure" — so the
+      SOC-001/SOC-002 KQL on event.outcome never matched.
+    - Appended `PerSourcePenalties no` to /etc/ssh/sshd_config.d/99-soc-lab.conf
+      with an inline comment explaining why and pointing to VM_A1's note.
+      `sshd -t` validated; restarted ssh.socket + ssh.service.
+    - Verified effective config: `sshd -T | grep persourcepenalties` →
+      `persourcepenalties no`. Banner check on 127.0.0.1:22 →
+      "SSH-2.0-OpenSSH_10.2p1 Ubuntu-2ubuntu3.2".
+    - Snapshot updated at ~/soc-project/ssh-and-vsftpd/99-soc-lab.conf.
+    - Pre-flight Phase 5 service health check before the change:
+      apache2 / mariadb / vsftpd / elastic-agent / suricata all active;
+      ssh.service "inactive" but ssh.socket active (socket-activation —
+      expected design). All green.
+  Pending / known gaps:
+    - Behavioral test (i.e. "does an actual brute-force attempt now emit
+      Failed password lines that the system integration parses?")
+      deferred to VM_A1 — they're the ones who'd re-run SOC-001/002 to
+      confirm the rules fire. From this side `sshd -T` is sufficient
+      evidence the kernel-level behavior changed.
+    - VM_B1 (TheHive + Cortex + MISP) was unreachable on all service
+      ports as of this session — host pings, nothing on :9000/:9001/:443.
+      Either docker stack didn't auto-start after a B1 reboot or
+      services are stopped. Flagged to user; B1's own session needs to
+      bring it back. Until then WF1's TheHive create node will 5xx and
+      bridge crons will idle.
+  Things to know:
+    - Drop-in is the right place for this — main /etc/ssh/sshd_config
+      stays distro-default and the lab-specific tweaks live in
+      99-soc-lab.conf, which already had PasswordAuthentication=yes and
+      PermitRootLogin=no with a "DO NOT COPY TO PRODUCTION" warning.
+    - If the demo wants to show PerSourcePenalties protection later
+      (i.e. "see how OpenSSH 9.x mitigates brute-force"), simply remove
+      the new line from the drop-in and restart ssh.
+
 2026-05-07 (latest) — victim-lab (VM_B2) — Active-response wired + post-test cleanup
   Done:
     - Created soc-response user (uid 1004, gid 1004, /home/soc-response,
