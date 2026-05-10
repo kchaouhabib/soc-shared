@@ -759,7 +759,7 @@ phase_10_testing:                     complete       # 2026-05-10: 7 SOC rules v
 phase_11_documentation:               pending
 
 last_updated: 2026-05-10
-updated_by: soc-core (VM_A1)
+updated_by: incident-mgmt (VM_B1)
 ```
 
 ---
@@ -770,6 +770,105 @@ updated_by: soc-core (VM_A1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-10 — incident-mgmt (VM_B1) — Cortex analyzers verified + OTXQuery hang fixed; flagging two A1-side bugs
+  Done:
+    - Re-verified all 4 Cortex analyzer instances in SOC-LAB org via the
+      orgadmin key (cortex-user, /api/analyzer):
+        AbuseIPDB           (defId=AbuseIPDB_2_0)            key set
+        VirusTotal_GetReport (defId=VirusTotal_GetReport_3_1) key set
+        OTXQuery            (defId=OTXQuery_2_0)             key set
+        MISP                (defId=MISP_2_2)                 key set
+      They were already registered with valid free-tier keys from earlier
+      Phase 4. Soc-core's "AbuseIPDB worker not registered" report was a
+      naming-version mismatch, not a missing instance — see Bug A1-#1 below.
+    - Live-tested AbuseIPDB (8.8.8.8 → Whitelisted/CDN/score 0) and
+      VirusTotal_GetReport (8.8.8.8 → 0/92 with 200 resolutions). Both
+      return in <5s. SUCCESS.
+    - OTXQuery was hanging forever. Root cause: upstream otxquery.py
+      had no HTTP timeout, and the `passive_dns` + `url_list` sections
+      return massive payloads for popular IPs (millions of records for
+      8.8.8.8) that never finish. The analyzer's blanket `except Exception`
+      then masked the real error.
+    - Patched /home/vboxuser/soc-project/thehive-cortex/cortex/Cortex-Analyzers/
+      analyzers/OTXQuery/otxquery.py on the host:
+        - timeout=15 on every requests.get (all 4 callsites)
+        - otx_query_ip: dropped passive_dns + url_list sections (kept
+          general, reputation, geo, malware); wrapped each section in its
+          own try/except so a single section failure no longer kills the
+          whole job; partial_errors[] reported when any section fails.
+    - Rebuilt soc-cortex:4.0.1-analyzers image and recreated the cortex
+      container (no host downtime — TheHive recovered automatically).
+      Verified via /api/analyzer/{id}/run on 198.51.100.1 (4 pulses,
+      0 malicious) and 185.220.101.1 (50 pulses, 1 malicious, known Tor
+      exit). Final smoke test 3/3 PASS in ~30s each. SUCCESS.
+    - WF3 (Daily Digest) error exec 274 inspected. NOT WF3-fatal but should
+      be fixed before Phase 11 — see Bug A1-#2 below.
+
+  Bugs flagged for VM_A1 (soc-core owner) — both unrelated to today's
+  cortex work but discovered while debugging it:
+
+    Bug A1-#1 (WF2 Cortex enrichment): "fetch observables" path now works
+              after the GET→POST/query fix, but the analyzer dispatch is
+              still calling `AbuseIPDB_1_0` (v1.0) which doesn't exist on
+              this Cortex install. The registered instance is
+              `AbuseIPDB_2_0` (v2.0). Cortex logs show:
+                  warn POST /api/analyzer/AbuseIPDB_1_0/run returned 404
+              Fix: WF2 should call AbuseIPDB by its INSTANCE id (not the
+              definition id with version suffix). Either use the instance
+              UUID 6b1c7570c74b55db697a69aa2c719b4f or POST to the
+              analyzer-by-type endpoint. Same applies to any other
+              hardcoded analyzer names — pull live definition IDs at
+              workflow build time.
+
+    Bug A1-#2 (WF3 Daily Digest): "TheHive: create digest case" node fails
+              JSON parse with "Bad control character in string literal at
+              position 280" on exec 274 (2026-05-10 07:00 UTC). Cause: the
+              JSON body template interpolates `{{ $('Aggregate queued
+              buckets').item.json.by_rule }}` and `.lines` directly into a
+              JSON string field. Those values contain real newlines / tabs
+              that aren't JSON-escaped. The existing `.replace(/\n/g,' ')`
+              only handles the AI-summary field and doesn't cover the
+              by_rule/lines fields. Fix: either JSON.stringify the entire
+              description and slice the outer quotes, or apply
+              `.replace(/[\x00-\x1f]/g,' ')` to every interpolated
+              field before injecting into the body. Note: the same
+              Ollama node also wrapped its own error object into the
+              output (since neverError: true), which masked the actual
+              failure. Recommend adding an If-node after Ollama to
+              short-circuit on missing $json.response.
+
+    Bug A1-#2b (WF3 historical): exec 253 (2026-05-08 07:00) failed at
+              the same node with "host is unreachable" — that was during
+              the 6-hour ES outage on B1, already resolved by the
+              permanent boot orchestration fix on 2026-05-10. Not a
+              standing issue.
+
+  Pending / known gaps (unchanged from prior log):
+    - Phase 11 (PFE rapport) — only open phase. Now unblocked.
+    - TheHive Platinum trial expires 2026-05-14 — assess Community
+      fallback impact (org-managed users may need to consolidate to
+      the 2-user license cap).
+    - Leaked secrets that hit public soc-shared CLAUDE.md earlier need
+      rotation (THEHIVE_BOT_API_KEY, SOCADMIN_KEY, CORTEX_USER_API_KEY,
+      MISP_API_KEY).
+
+  Things to know:
+    - The otxquery.py patch is in soc-project on B1 — that tree is
+      NOT in soc-shared (it's a vendored upstream clone). If A1 has its
+      own cortex install for any reason, the patch needs to be re-applied
+      there. B1's cortex is the canonical one for SOC-LAB so this isn't
+      blocking.
+    - Cortex analyzer call latency: AbuseIPDB ~1-3s, VT_GetReport ~3-5s,
+      OTXQuery ~25-35s (still slow due to the 4 sequential section
+      calls; could parallelize later if needed). All within reasonable
+      enrichment SLAs.
+    - SOC-LAB org now has these analyzer instance IDs (use these when
+      referencing analyzers in workflows, not the *_2_0 definition ids):
+        AbuseIPDB             = 6b1c7570c74b55db697a69aa2c719b4f
+        VirusTotal_GetReport  = 8cac1902c2e7879f2d258a3bfc7ba1f5
+        OTXQuery              = eb540d51238c71257ca2713bafd84d2e
+        MISP                  = b20c109bfc76cda9b8690ebf77f77931
+
 2026-05-10 — soc-core (VM_A1) — Phase 10 COMPLETE: 7 bug fixes + auto_block end-to-end + observable pipeline fix
   Done:
     - Phase 10 closed. All 13 custom SOC rules either (a) fired and pipelined
