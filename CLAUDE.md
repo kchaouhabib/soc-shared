@@ -759,7 +759,7 @@ phase_10_testing:                     complete       # 2026-05-10: 7 SOC rules v
 phase_11_documentation:               pending
 
 last_updated: 2026-05-10
-updated_by: incident-mgmt (VM_B1)
+updated_by: soc-core (VM_A1)
 ```
 
 ---
@@ -770,6 +770,68 @@ updated_by: incident-mgmt (VM_B1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-10 — soc-core (VM_A1) — Both A1-side bugs B1 flagged are patched
+  Done:
+    - Bug A1-#1 (WF2 Cortex analyzer ID mismatch): root cause was deeper
+      than version mismatch. Cortex's run endpoint requires the analyzer
+      INSTANCE UUID, not the analyzer DEFINITION ID — POSTing to
+      /api/analyzer/AbuseIPDB_2_0/run also returns 404 (verified directly
+      with curl + cortex-user bearer). B1's hint was right: instance UUID.
+      Patched all 3 Cortex calls in WF2 (`HYiSFNStG5zEG6ZA`):
+        Cortex: AbuseIPDB        → 6b1c7570c74b55db697a69aa2c719b4f
+        Cortex: VirusTotal hash  → 8cac1902c2e7879f2d258a3bfc7ba1f5
+        Cortex: VirusTotal URL   → 8cac1902c2e7879f2d258a3bfc7ba1f5
+      Saved to ~/soc-project/n8n/workflows/02-cortex-enrichment.json.
+      Verified end-to-end: WF2 exec 292 against case #19 → AbuseIPDB job
+      zQP2E54B5tZAINNEkyVJ created (status=InProgress) → completed in <5s →
+      report taxonomies: Usage=Reserved, Score=0, Reports=0 (private IP,
+      expected). Cortex is now actually running the analyzer; the entire
+      WF2 chain works.
+      Caveat: WF2 fires-and-forgets the Cortex job (just logs "dispatched"
+      to TheHive case after Cortex returns). The Cortex report does NOT
+      auto-attach to the TheHive observable — that would require the
+      TheHive "run analyzer" endpoint instead of direct Cortex calls.
+      Acceptable for Phase 10 (analyzers prove they work and run); a
+      proper Phase-11-or-later refactor could move the orchestration to
+      TheHive's responder framework so reports land on observables.
+    - Bug A1-#2 (WF3 Daily Digest control-char): patched WF3 (`Z1VpjJlhg2Skek1B`)
+      "TheHive: create digest case" jsonBody to apply
+      `String(x).replace(/[\x00-\x1f]/g,' ')` to all three string-injected
+      fields (AI summary, by_rule, lines), not just the AI summary as
+      before. Saved to ~/soc-project/n8n/workflows/03-daily-digest.json.
+      Validation deferred — n8n public API doesn't expose manual workflow
+      execution; next scheduled run is 2026-05-11 08:00 UTC. The fix is
+      the literal recommendation B1 made.
+    - Bug A1-#2b (historical exec 253 host-unreachable): noted, no action —
+      already resolved by B1's boot-orchestration fix.
+
+  Phase 10 status delta:
+    - WF2 enrichment routing: previously broken end-to-end (404 on /run).
+      Now fully functional through Cortex job creation + completion.
+    - Phase 10 metric "active analyzer instances reachable from WF2": 1/3
+      verified (AbuseIPDB), 2/3 patched but not yet smoke-tested
+      end-to-end through WF2 (VirusTotal hash + URL — same UUID-resolution
+      mechanism, expected to work).
+
+  Pending / known gaps:
+    - Phase 11 (rapport) — only open phase. Material in ~/pfe/docs/REPORT.md
+      and soc-shared docs/.
+    - WF2 → TheHive observable report-attach (design choice, see caveat
+      above) — optional polish for Phase 11 demo.
+    - WF3 manual smoke at 2026-05-11 08:00 UTC will confirm Bug A1-#2 fix
+      end-to-end; meanwhile the patch is staged.
+
+  Things to know:
+    - Cortex instance UUIDs are stable across redeploys when persisted via
+      Cortex DB. If the SOC-LAB org's analyzers are ever recreated, the
+      UUIDs change and WF2 needs re-patching. To future-proof, WF2 could
+      query `/api/analyzer?range=0-10` at workflow start and resolve
+      `name=AbuseIPDB` → `id` dynamically — but that's another node and
+      left as a Phase-11 polish item.
+    - The Cortex bearer for SOC-LAB org admin (cortex-user) is the same
+      one B1 documented, value unchanged. WF2 uses n8n credential id
+      `HK1qH743oIbnpSbk` (Header Auth, `Cortex Bearer`).
+
 2026-05-10 — incident-mgmt (VM_B1) — Cortex analyzers verified + OTXQuery hang fixed; flagging two A1-side bugs
   Done:
     - Re-verified all 4 Cortex analyzer instances in SOC-LAB org via the
