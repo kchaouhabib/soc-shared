@@ -755,11 +755,11 @@ phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 
 phase_7_detection_layer_activation:   complete       # 1644 Elastic prebuilt rules installed; ES license trial-activated for .webhook connector; n8n webhook connector id 7c351a6c-4de6-4c07-8146-fa337033c735 (POST → http://192.168.1.50:5678/webhook/elastic-alert); 13 SOC custom rules (SOC-001..SOC-013) imported from ~/soc-project/kibana/soc-rules.ndjson and enabled, all with native MITRE threat[] tagging, webhook action, meta.auto_block flag (true on 002/004/006/009/011); SOC-008 partial-failure benign (FIM indices not yet present); Suricata/Apache rules waiting on VM_B2 to come back online
 phase_8_soar_integration:             complete       # WF1+WF2 ACTIVE; B1 wiring done 2026-05-07: real bearers minted (TheHive=rtHZuTw01P0UwaeDKmcT04bBQZmxvlGM for soc-bot@thehive.local in new SOC-LAB org [analyst profile]; Cortex=existing cortex-user key 6MWnt7E3FdH0muqjoG6Xyd+5msDQf4S2 reused). VM_A1 owner pastes bearers into n8n UI for cred ids Ux32rgVuHoXKc1GY / HK1qH743oIbnpSbk (n8n public API has no PATCH for creds; UI edit keeps id stable). TheHive→WF2 wired via polling bridge (~/soc-project/thehive-cortex/cron-cases-to-wf2.sh, every 1m) — TheHive 5.7.1 native notification.endpoints+items config accepts the rule but actor never dispatches; bridge posts Case JSON in TheHive's native envelope shape ({operation,objectType,objectId,object}) directly to /webhook/thehive. Smoke verified case=~32880 wf2=200.
 phase_9_adaptive_intelligence:        complete       # WF3+WF4+WF5 ACTIVE; MISP→WF4 wired via polling bridge (~/soc-project/misp/cron-publish-to-wf4.sh, every 1m, uses /events/restSearch with publish_timestamp filter — MISP 2.5 has no native single-URL outbound webhook). WF4 Ollama timeout caveat unchanged.
-phase_10_testing:                     in-progress    # 2026-05-07: full end-to-end pipeline verified — SOC-004 SQLi attack from VM_A1 → Apache log → ES → SOC-004 rule fires → webhook → WF1 (14 nodes) → ML score 0.6335 → Ollama summary (200s) → TheHive case ~40984800 number 11 in SOC-LAB org with full MITRE/anomaly metadata → SSH iptables block on VM_B2 succeeded → TheHive auto-block comment posted → bridge picked up case 60s later → WF2 fired Cortex enrichment exec 24. Auto-block confirmed by losing connectivity to VM_B2 from A1.
+phase_10_testing:                     complete       # 2026-05-10: 7 SOC rules verified end-to-end (cases #13/14/15/17/18/19 + correlation absorption); 7 bug fixes applied this Phase: #1 sshd→sshd-session OpenSSH 9.x rename (SOC-001/002/012 KQL), #2 SOC-005 KQL bare-`<script>` invalid → URL-encoded only, #3 SOC-011 KQL wildcards-around-quoted-phrase invalid → `message:"bash -i" or ...`, #4 (same as #1 for SOC-012), #5 WF1 source_ip array-of-string fix via IIFE pick-first-IPv4 (Bug confirmed when SOC-011 multi-NIC host emitted JSON-string-of-array breaking JSON body interpolation), #6 SOC-011 self-trigger fix via `not host.name:"soc-core"`, #7 WF2 fetch-observables GET→POST query API (TheHive 5 has no GET /case/{id}/observables; was returning 404 silently breaking Cortex enrichment forever). New WF1 node `wf1-14b-add-observable` added (POST /case/{id}/observable with source_ip → ip dataType, tlp 2, ioc true). Auto-block path verified end-to-end SOC-006 from .52 (kali) → iptables DROP on B2 targeting .52 → A2 lost B2 access, A1 retained access (selective-source verification). WF2 Cortex remaining gap: AbuseIPDB worker not registered (worker not found); requires user-supplied API key in Cortex UI — config gap, not pipeline bug. Latency: fast paths (no NLP) 0.4-2.8s, slow paths (Ollama summarize) 60-632s. Correlation reduction observed: SOC-006 second batch 36 alerts → 1 case via Kibana action summary mode + correlation 30-min bucket; SOC-006 first batch absorbed into existing SOC-012 bucket from same source (escalate_existing).
 phase_11_documentation:               pending
 
-last_updated: 2026-05-08
-updated_by: victim-lab (VM_B2)
+last_updated: 2026-05-10
+updated_by: soc-core (VM_A1)
 ```
 
 ---
@@ -770,6 +770,105 @@ updated_by: victim-lab (VM_B2)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-10 — soc-core (VM_A1) — Phase 10 COMPLETE: 7 bug fixes + auto_block end-to-end + observable pipeline fix
+  Done:
+    - Phase 10 closed. All 13 custom SOC rules either (a) fired and pipelined
+      to a TheHive case with observable + Cortex routing this session,
+      (b) verified in previous sessions, or (c) deferred (SOC-008/009/010/013
+      require local execution on B2 which is out of scope for this pass).
+    - 7 distinct bugs found and patched this Phase:
+        Bug #1: SOC-001/002/012 KQL `process.name:"sshd"` → did not match
+                because OpenSSH 9.x renames the per-connection child to
+                `sshd-session`. Broadened to `(sshd OR sshd-session)`.
+        Bug #2: SOC-005 KQL had bare `*<script*` token — invalid KQL
+                ("Expected ),AND,OR but '<' found"). Dropped the bare clause;
+                URL-encoded variants (*%3Cscript*) cover the actual HTTP
+                traffic anyway.
+        Bug #3: SOC-011 KQL `*"bash -i"*` with wildcards around quoted
+                phrase = invalid KQL syntax. Rewrote without wildcards:
+                `message:"bash -i" or message:"/dev/tcp/" or ...`.
+        Bug #4: SOC-012 same OpenSSH 9.x sshd→sshd-session rename (variant
+                of Bug #1, separate rule).
+        Bug #5: WF1 "Build canonical payload" — source_ip resolution.
+                When the alert host has multiple NICs (B2's host.ip is an
+                array of 5 entries: lo IPv6, ZeroTier IPv4, ZeroTier IPv6,
+                etc.), the array serialized as JSON-string-of-array which
+                broke the downstream JSON body interpolation in TheHive
+                create-case. Fixed with an IIFE that picks the first IPv4
+                from the array.
+        Bug #6: SOC-011 KQL was firing on its own past failure messages
+                stored in soc-core's event-log indices (rule logs contain
+                the trigger pattern as plain text). Fixed by prepending
+                `not host.name:"soc-core"` to the rule query.
+        Bug #7: WF2 "TheHive: fetch observables" was GETting
+                `/api/v1/case/{id}/observables` which TheHive 5 doesn't
+                expose (returns 404 with `{"type":"NotFoundError"...}`).
+                Cortex enrichment had been silently broken since the start —
+                the 404 response had no `dataType` field so Switch routed
+                every observable to "Skip: unsupported dataType". Patched
+                to POST `/api/v1/query` with `getCase + observables` shape.
+                Verified: now correctly fetches the observable and routes
+                to AbuseIPDB analyzer node.
+    - New WF1 node `wf1-14b-add-observable` (n8n-nodes-base.httpRequest)
+      inserted between "TheHive: create case" and "Correlation Engine:
+      set_case". Creates a source_ip observable (dataType=ip, tlp=2, pap=2,
+      ioc=true, sighted=true, tags=[soc-auto, source.ip]) on every new
+      TheHive case. Verified populates the Observables tab on cases
+      #17/18/19 created this session.
+    - Auto_block path verified end-to-end via SOC-006 from .52 (kali):
+      apache.access logs ingest → SOC-006 rule fires → WF1 create_new path
+      → ML score + Ollama summary + TheHive case #19 + observable creation
+      → SSH from A1 → B2 → `iptables -I INPUT -s 192.168.1.52 -j DROP`
+      (exit 0) → TheHive auto-block comment. Verified A2 lost B2 access
+      (curl timed out, http=000), A1 retained access via soc-response key
+      (selective source-IP blocking confirmed). Cleaned up the iptables
+      rule post-test (`iptables -D INPUT -s 192.168.1.52 -j DROP`).
+    - Closed 19 stale correlation buckets at session start (some 5 days
+      old). Bucket window is 30 min so they were dead anyway but they
+      showed up in /state and made debugging noisy.
+    - Verified TheHive native webhook notifier IS firing — case-creation
+      now triggers WF2 automatically (exec 284 fired ~3 min after case
+      #18 was created, no bridge cron involvement). Bridge-cron path
+      from Phase 8 remains as backup.
+  Phase 10 cases (rapport-grade):
+    #13 SOC-001 SSH brute (sev 4)        — prior session
+    #14 SOC-005 XSS (sev 2)              — prior session
+    #15 SOC-011 reverse shell (sev 4)    — prior session (Bug #5 confirmed live in case title: "from 10.0.2.15")
+    #17 SOC-005 XSS (sev 2)              — this session, observable validated post-Bug #7 fix
+    #18 SOC-012 SSH from non-mgmt (sev 4) — this session, escalated by SOC-006 absorption
+    #19 SOC-006 cmd injection (sev 3)    — this session, auto_block fired
+    SOC-007 absorbed into bucket via correlation queue path (no case)
+  Latency observations:
+    - Fast WF1 path (no NLP, correlation = add_to_existing/queue): 0.4-2.8s
+    - Slow WF1 path (Ollama summarize on create_new): 60-632s
+    - Worst case: SOC-005 first this session = 614s (Ollama cold);
+      subsequent SOC-006 = 135s (Ollama warm).
+    - SOC-006 second batch: 36 alerts → 1 case (Kibana action summary mode
+      collapses to one webhook + correlation absorbs duplicates).
+  Pending / known gaps:
+    - Cortex AbuseIPDB analyzer worker not registered ("worker AbuseIPDB_1_0
+      not found"). Requires user to add free-tier API key in Cortex UI
+      (Org SOC-LAB → Analyzers → enable AbuseIPDB_1_0 with key). Same
+      applies to VirusTotal_GetReport_3_1 and OTXQuery_2_0.
+    - SOC-008 (file mod), SOC-009 (web shell), SOC-010 (sudo escalation),
+      SOC-013 (data exfil) not run — these require local execution on B2
+      victim. Deferred to a focused B2 attack session.
+    - Daily Digest (WF3) errored at 07:00:01Z today (exec 274 status=error).
+      Not a blocker but should be inspected before Phase 11 doc.
+    - A2 (kali) has no internet — `apt install` failed. Set up apt offline
+      cache or proxy through A1 if more tools needed.
+  Things to know:
+    - A2 sshd was disabled at session start; user enabled with
+      `sudo systemctl enable --now ssh` on A2 console. Now reachable.
+    - SOC-012 fires only on successful SSH login from a non-management
+      host. Triggering it requires sshing FROM .52 TO .53 (not from A1).
+      Used expect on A2 to chain through password auth.
+    - WF1 + WF2 saved locally to ~/soc-project/n8n/workflows/ on A1.
+    - For demos: re-fire SOC-006 from a fresh source IP after closing any
+      existing bucket from that source — same-source within 30 min hits
+      add_to_existing/escalate_existing branch and skips the auto_block
+      node.
+
 2026-05-08 — victim-lab (VM_B2) — SSH brute-force log shape fix (PerSourcePenalties off)
   Done:
     - Closed the SOC-001/SOC-002 detection-blind-spot identified in
