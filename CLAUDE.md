@@ -749,7 +749,7 @@ phase_0_git_setup:                    complete       # VM_A1, VM_B1, VM_B2 done;
 phase_1_zerotier:                     complete       # VM_A1 .50 (node 785fd1806c), VM_B1 .51 (node 9ab369cb6c), VM_B2 .53 (node aa429ed844) all reachable; VM_A2 descoped
 phase_2_vm_a1_siem_core:              complete       # ES 8.19.14 single-node (heap dropped 4G→2G in phase 3 to fit Ollama; backup at heap.options.bak-20260505), Kibana 8.19.14, Logstash 8.19.14 (beats:5044, syslog:5140 → ES), Elastic Agent + Fleet Server 8.19.14 on :8220 enrolled in fleet-server-policy. ufw active with allow from 192.168.1.0/24. SOC-Core OS is Ubuntu 26.04 LTS (matches VM_B1, plan said 22.04).
 phase_3_vm_a1_soar_and_ai:            complete       # n8n 2.18.5 systemd on :5678; Ollama 0.22.1 + llama3.1:8b warm with KEEP_ALIVE=24h (cold load ~5min, ~0.3 tok/s CPU-only); 8G swap added. RE-ARCHITECTED: only 2/4 Flask APIs built — ML Anomaly :5000 (IsolationForest, /train pulls .alerts-security.alerts-default), Correlation Engine :5002 (SQLite, 30-min bucket / 2h kill-chain windows; 6 actions verified). DROPPED: NLP API (replaced by n8n→Ollama directly via HTTP node) and MITRE Auto-Tagger (replaced by Kibana's built-in threat[] field at rule definition + Sigma tags + community classtype JSONs). systemd units for ml-api + correlation-engine; /opt/<svc> symlinks back to ~/soc-project/<svc>.
-phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive + Cortex (custom soc-cortex:4.0.1-analyzers image, process mode) + MISP all running; 4 MISP feeds enabled with 6h cron; 30 Cortex analyzers active in SOC-LAB org (4 original verified end-to-end + 26 no-key bulk-enabled 2026-05-14); MISP analyzer URL fixed 127.0.0.1→192.168.1.51 (2026-05-14); ufw active with ZT-only allow rules
+phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive + Cortex (custom soc-cortex:4.0.1-analyzers image, process mode) + MISP all running; 4 MISP feeds enabled with 6h cron; 30 Cortex analyzers active in SOC-LAB org (4 original verified end-to-end + 26 no-key bulk-enabled 2026-05-14); MISP analyzer URL fixed 127.0.0.1→192.168.1.51 (2026-05-14); TheHive→Cortex + TheHive→MISP connector servers registered via thehive/conf/application.conf (cortex.servers + misp.servers, 2026-05-14) — TheHive UI "Run Analyzer" + MISP-pull scheduled actor now functional; ufw active with ZT-only allow rules
 phase_5_vm_b2_victim_lab:             complete       # Apache+PHP8.5+MariaDB up; DVWA at /dvwa; vsftpd:21 + ssh:22 + 3 weak users; Suricata 8.0.3 with 49911 ET Open rules; Elastic Agent enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45) HEALTHY; integrations attached on VM_A1 Kibana: system-2 + apache-victim-lab (/var/log/apache2/access_soc.log+access.log+error.log) + suricata-victim-lab (/var/log/suricata/eve.json) + vsftpd-victim-lab (Custom Logs /var/log/vsftpd.log → dataset 'vsftpd'). Used native Suricata + Apache integrations (NOT Custom Logs) — pre-parsed/ECS/dashboards. Suricata index growing live (~58k+ docs at attach time). Active-response wired 2026-05-07: soc-response user (uid 1004, password locked) with VM_A1's ed25519 pubkey in /home/soc-response/.ssh/authorized_keys + /etc/sudoers.d/soc-response NOPASSWD for both /sbin/iptables and /usr/sbin/iptables; verified end-to-end by Phase 10 SQLi test (WF1 SSH+iptables rc=0). SSH brute-force log shape fixed 2026-05-08: PerSourcePenalties no in /etc/ssh/sshd_config.d/99-soc-lab.conf so repeated auth failures emit standard "Failed password" lines instead of OpenSSH 9.x's "penalty: failed authentication" — required for SOC-001/SOC-002 to fire (per VM_A1 Phase 10 note). OBSOLETE: original "MITRE Tagger /scan/suricata cron + /refresh from classification.config" deferred items dropped in Phase 3 re-architecture (Kibana threat[] + Sigma attack.t#### + community classtype JSONs replace it).
 phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
 phase_7_detection_layer_activation:   complete       # 1644 Elastic prebuilt rules installed; ES license trial-activated for .webhook connector; n8n webhook connector id 7c351a6c-4de6-4c07-8146-fa337033c735 (POST → http://192.168.1.50:5678/webhook/elastic-alert); 13 SOC custom rules (SOC-001..SOC-013) imported from ~/soc-project/kibana/soc-rules.ndjson and enabled, all with native MITRE threat[] tagging, webhook action, meta.auto_block flag (true on 002/004/006/009/011); SOC-008 partial-failure benign (FIM indices not yet present); Suricata/Apache rules waiting on VM_B2 to come back online
@@ -770,6 +770,61 @@ updated_by: incident-mgmt (VM_B1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-14 (later) — incident-mgmt (VM_B1) — TheHive→Cortex + TheHive→MISP connector servers registered
+  Done:
+    - Added `cortex { servers = [...] }` and `misp { servers = [...] }`
+      blocks to ~/soc-project/thehive-cortex/thehive/conf/application.conf
+      (bind-mounted at /etc/thehive/application.conf inside the container).
+      Cortex server points to http://192.168.1.51:9001 with the cortex-user
+      bearer; MISP server points to https://192.168.1.51:8443 with the
+      admin key and acceptAnyCertificate:true + 1-hour pull interval.
+    - Restarted TheHive (Cassandra + ES untouched per standing constraint).
+      Boot log confirms: `TheHiveMispClientImpl: Add MISP connection
+      SOC-LAB-MISP` and `Starting actor MISP` as cluster singleton.
+    - Verified via TheHive's connector layer:
+        GET /api/connector/cortex/analyzer?range=all → 31 analyzers
+          all tagged cortexIds=['SOC-LAB-Cortex'] (matches Cortex direct view)
+        MISP integration confirmed by the MispActor singleton starting
+          on boot — sync is scheduled (no manual HTTP route), first pull
+          happens within the 1h interval window.
+    - Net effect: TheHive UI "Run Analyzer" / "Run Responder" buttons
+      now work directly against Cortex (no need to go through n8n WF2 for
+      manual enrichment), and MISP events will start appearing as TheHive
+      alerts on the scheduled poll. The existing n8n bridges
+      (cron-cases-to-wf2.sh and cron-publish-to-wf4.sh) remain in place
+      and unchanged — they were never blocked by the connector gap.
+
+  Configuration trap discovered:
+    - PUT /api/config/organisation/cortex returns 500 with
+      "No configuration setting found for key 'organisation.defaults.cortex'"
+      until a baseline `cortex { servers = [...] }` exists in
+      application.conf. Per-org override via the config API ONLY works
+      when the connector has a global default. Same for misp.
+    - Org-admin SOCADMIN_KEY can read/write `/api/config/organisation/*`
+      but the global `/api/config/cortex` path requires a SUPERADMIN
+      bearer (admin@thehive.local). For lab use, just put it in
+      application.conf — no superadmin needed.
+
+  Pending / still missing in TheHive (small items):
+    - 0 case templates (no SOC playbooks for SOC-001/006/etc.)
+    - 0 custom fields (no mitre-tactic, originating-rule-id, etc.)
+    - 0 taxonomies imported (no TLP-extended, MISP-galaxy)
+    - Only 1 notification trigger (CaseCreated); could add CaseClosed,
+      AlertCreated, TaskClosed for finer-grained SOAR signals
+    - 0 Cortex responders (Mailer, MISP_create_event) — Cortex-side config,
+      not TheHive's; would enable "Run Responder" from TheHive UI to
+      auto-push observables back to MISP, send analyst emails, etc.
+
+  Note for next instance:
+    - application.conf changes require TheHive container restart to take
+      effect (no hot-reload). Cassandra + ES stay running through the
+      restart; TheHive recovers itself in ~30-60s.
+    - The thehive/conf/application.conf file lives in
+      ~/soc-project/thehive-cortex/thehive/conf/ on VM_B1 and is NOT in
+      git (per repo convention — soc-shared only carries CLAUDE.md+docs).
+      The current contents are: notification.endpoints (n8n-soc webhook),
+      cortex.servers (SOC-LAB-Cortex), misp.servers (SOC-LAB-MISP).
+
 2026-05-14 — incident-mgmt (VM_B1) — Project handbook delivered + Cortex analyzer expansion (4→30) + MISP analyzer URL fix + perf rescue
   Done:
     - PROJECT HANDBOOK delivered: docs/SOC-AUTONOME-HANDBOOK.md
