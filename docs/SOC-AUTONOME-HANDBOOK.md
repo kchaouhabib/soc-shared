@@ -1,0 +1,1834 @@
+# SOC Autonome — Complete Project Handbook
+
+> Generated 2026-05-12 — covers everything from project inception through current state.
+> Single self-contained reference for the SOC Autonome PFE (Projet de Fin d'Études).
+> Author: Habib Kchaou (kchaou.habib67@gmail.com).
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#1-executive-summary)
+2. [The 4-VM Architecture](#2-the-4-vm-architecture)
+3. [Network and Connectivity](#3-network-and-connectivity)
+4. [The 5 n8n Workflows — Node-by-Node Walkthrough](#4-the-5-n8n-workflows--node-by-node-walkthrough)
+5. [The TheHive / Cortex / MISP Stack (VM_B1)](#5-the-thehive--cortex--misp-stack-vm_b1)
+6. [The Detection Stack (VM_A1)](#6-the-detection-stack-vm_a1)
+7. [The Victim and Attacker (VM_B2, VM_A2)](#7-the-victim-and-attacker-vm_b2-vm_a2)
+8. [End-to-End Pipeline Scenarios](#8-end-to-end-pipeline-scenarios)
+9. [Credentials and Keys (Reference Table)](#9-credentials-and-keys-reference-table)
+10. [Outstanding Work](#10-outstanding-work)
+11. [Operational Cheatsheet](#11-operational-cheatsheet)
+
+---
+
+## 1. Executive Summary
+
+**SOC Autonome** is a fully autonomous Security Operations Center built end-to-end for a final-year engineering project (PFE). The system detects attacks across four independent layers (network IDS, host-log signatures, threat-intelligence matching, and behavioural ML), correlates redundant alerts into a single incident, summarises every incident in plain language using a local LLM, enriches observables through a panel of Cortex analyzers, and pushes critical incidents to active response (auto-block) — all without any analyst writing a manual rule or making a triage decision by hand. The whole stack is open source and runs at zero ongoing cost: Elastic Stack 8.x, TheHive 5, Cortex 4, MISP 2.5, n8n, Suricata, Ollama (with `llama3.1:8b`), and two small Flask microservices written specifically for this project.
+
+**Headline goal.** Reduce the human L1/L2 SOC workload by automating the path from packet-on-the-wire to enriched, deduplicated, MITRE-tagged incident in TheHive — so the human analyst spends time on incidents that matter rather than triaging alert storms.
+
+**Headline result.** As of 2026-05-10 the pipeline is verified end-to-end: real Kibana detection rules fire, n8n correlates them, TheHive cases are created with AI summaries and Cortex enrichment routes, critical rules trigger live iptables blocks on the victim VM, and four scheduled or event-driven n8n workflows keep the system maintaining itself (daily digest, weekly ML retraining, MISP-driven AI rule generation). Cases #13–#19 in TheHive's SOC-LAB organisation are the rapport-grade evidence trail.
+
+**Current phase status (from CLAUDE.md `current_state`).**
+
+| Phase | Status |
+|---|---|
+| Phase 0 — bootstrap | complete |
+| Phase 1 — ZeroTier network | complete |
+| Phase 2 — VM_A1 SIEM core | complete |
+| Phase 3 — VM_A1 SOAR + AI (re-architected) | complete |
+| Phase 4 — VM_B1 incident mgmt | complete |
+| Phase 5 — VM_B2 victim lab | complete |
+| Phase 6 — VM_A2 Kali attacker | **descoped** |
+| Phase 7 — Detection layer activation | complete |
+| Phase 8 — SOAR integration | complete |
+| Phase 9 — Adaptive intelligence | complete |
+| Phase 10 — End-to-end testing | complete |
+| Phase 11 — Documentation & PFE report | **pending** |
+
+**Star metrics.**
+
+What works (verified):
+
+- All 13 custom SOC detection rules (SOC-001 … SOC-013) are installed and enabled with native MITRE `threat[]` tagging.
+- 1,644 Elastic prebuilt rules are installed (disabled by default; enable selectively).
+- 49,911 Suricata Emerging Threats Open rules are loaded on VM_B2.
+- 5 n8n workflows are authored, imported, active, and have been exercised live.
+- TheHive case-creation now fires WF2 directly via the native `CaseCreated` notifier (post-fix on 2026-05-10) — webhook endpoint `n8n-soc` → `http://192.168.1.50:5678/webhook/thehive`. A polling bridge from 2026-05-07 remains as fallback.
+- Auto-block path verified end-to-end on 2026-05-10: SOC-006 from 192.168.1.52 → WF1 create_new → SSH from VM_A1 to VM_B2 → `iptables -I INPUT -s 192.168.1.52 -j DROP` (rc=0) → comment back to TheHive case.
+- Cortex analyzer end-to-end live for AbuseIPDB, VirusTotal, OTXQuery (patched), MISP (analyzer instance UUIDs documented).
+- Correlation reduction observed: 36 alerts collapsed to 1 case (Kibana summary mode + 30-min bucket).
+
+Known-broken / open items:
+
+- WF3 Daily Digest had a JSON control-character bug on exec 274 (2026-05-10 07:00 UTC) that the latest workflow snapshot already mitigates with `replace(/[\x00-\x1f]/g, ' ')` — keep monitoring (see Scenario G).
+- WF2 had been using `AbuseIPDB_1_0` (analyzer **definition** id with wrong version suffix) which returns 404 on this Cortex install. The current snapshot uses the **instance UUID** path `/api/analyzer/6b1c7570c74b55db697a69aa2c719b4f/run` — fixed (see Scenario H).
+- TheHive Platinum 15-day trial expires **2026-05-14**. Community fallback may force consolidation to the 2-user license cap and disable some org-admin / multi-org features (Scenario I).
+- 4 secrets leaked into the public `soc-shared` Git repo earlier in the project (`THEHIVE_BOT_API_KEY`, `SOCADMIN_KEY`, `CORTEX_USER_API_KEY`, `MISP_API_KEY`). Rotation pending.
+- Phase 11 (rapport de PFE writing) is the only open phase.
+
+---
+
+## 2. The 4-VM Architecture
+
+The project runs on **4 virtual machines** distributed across **2 physical PCs**. VMs talk to each other over a **ZeroTier overlay network** (`cf719fd54008e4d1`) on subnet `192.168.1.0/24` — so the project works the same whether the two PCs are on campus wifi, a mobile hotspot, or different buildings.
+
+```
+ZeroTier overlay — 192.168.1.0/24
+
+  PC_A                              PC_B
+  ┌─────────────────────┐           ┌─────────────────────────────────────┐
+  │ VM_A1  192.168.1.50 │           │ VM_B1  192.168.1.51                 │
+  │ soc-core            │◄─────────►│ incident-mgmt                       │
+  │                     │           │                                     │
+  │ VM_A2  192.168.1.52 │           │ VM_B2  192.168.1.53                 │
+  │ kali-attacker       │──attacks─►│ victim-lab                          │
+  └─────────────────────┘           └─────────────────────────────────────┘
+```
+
+### 2.1 VM_A1 — soc-core (the brain)
+
+| Field | Value |
+|---|---|
+| Hostname | `SOC-Core` |
+| IP | `192.168.1.50` |
+| OS | Ubuntu 26.04 LTS (Resolute Raccoon) — note: plan said 22.04, in-place OS upgrade landed it on 26.04 |
+| Host PC | PC_A |
+| Role | SIEM core + SOAR + AI services — this is the brain of the SOC |
+| RAM allocated | 13 GB (plan called for 12 min / 20 recommended). Tight; ES heap dropped 4 GB → 2 GB to fit Ollama, 8 GB swap added |
+| Storage | 200 GB SSD minimum, SSD strongly recommended (Elasticsearch is disk-bound) |
+| ZeroTier node ID | `785fd1806c` |
+
+**What runs here:**
+
+| Service | Version | Port | Purpose |
+|---|---|---|---|
+| Elasticsearch | 8.19.14 | 9200 (HTTPS, self-signed) | Central log/alert store. Single-node mode, security enabled |
+| Kibana | 8.19.14 | 5601 (HTTP, lab) | SIEM UI, detection engine, Fleet UI |
+| Logstash | 8.19.14 | 5044 (beats), 5140 (syslog) | Log preprocessing pipeline `soc-pipeline.conf` → ES |
+| Fleet Server (Elastic Agent) | 8.19.14 | 8220 (HTTPS, self-signed) | Central agent management |
+| n8n | 2.18.5 | 5678 | SOAR / workflow automation, hosts the 5 workflows |
+| Ollama | 0.22.1 | 11434 | Local LLM runtime, `llama3.1:8b` warm with `OLLAMA_KEEP_ALIVE=24h` |
+| ML Anomaly API (Flask) | — | 5000 | Isolation Forest anomaly scoring |
+| Correlation Engine (Flask) | — | 5002 | Alert grouping, kill-chain detection |
+
+**Memory budget:** Elasticsearch ≈ 2 GB heap, Ollama (model loaded) ≈ 6 GB, Logstash ≈ 1 GB heap, Kibana ≈ 1 GB, Flask APIs combined ≈ 1 GB, n8n ≈ 512 MB, Fleet Server ≈ 512 MB, OS overhead ≈ 1 GB. Cold-load of the LLM model is ≈ 5 min from disk; warm-path generation runs at ≈ 0.3 tok/s CPU-only (slow but workable for batch SOAR use).
+
+**What you, the project author, do FROM VM_A1 day-to-day:**
+
+- Browse `http://192.168.1.50:5601` to inspect Kibana detection rules, alert volume, and the SIEM dashboards.
+- Browse `http://192.168.1.50:5678` to edit and inspect n8n workflows and read recent executions.
+- SSH into the VM to tail Ollama / Flask logs (`journalctl -u ml-api`, `journalctl -u correlation-engine`, `journalctl -u n8n`, `journalctl -u ollama`).
+- Run ad-hoc curl calls to the Flask APIs to debug correlation state (`curl localhost:5002/state`) or to retrain the ML model (`curl -X POST localhost:5000/train -d '{"days":30}' -H "Content-Type: application/json"`).
+- Patch detection rules via the Kibana detection-engine API.
+- Outbound SSH from `~/.ssh/soc_response` (the n8n auto-block key, ed25519) lands on VM_B2 as user `soc-response` for active response.
+
+**Local-only project tree on VM_A1 (`~/soc-project/`):** `elasticsearch/`, `kibana/`, `logstash/`, `fleet/`, `ollama/`, `n8n/workflows/`, `ml-api/`, `correlation-engine/`. The `nlp-api/` and `mitre-tagger/` directories still exist on disk as leftovers from the original plan but were dropped on 2026-05-05 (see Section 6).
+
+### 2.2 VM_B1 — incident-mgmt (the case workbench)
+
+| Field | Value |
+|---|---|
+| Hostname | `incident-mgmt` |
+| IP | `192.168.1.51` |
+| OS | Ubuntu 26.04 LTS (codename "resolute") |
+| Host PC | PC_B |
+| Role | Incident management + threat intelligence |
+| RAM allocated | 9 GB (plan called for 10 min / 14 recommended). Snapshot at end of Phase 4 was 6.0/9.0 GB used; no swap |
+| Storage | 100 GB minimum |
+| ZeroTier node ID | `9ab369cb6c` |
+
+**What runs here:**
+
+| Service | Version | Port | Purpose |
+|---|---|---|---|
+| Cassandra | 4.1.11 | 9042 (CQL, localhost only) | TheHive backend storage. 512 MB heap cap |
+| Elasticsearch (local) | 8.19.14 | 9200 (localhost only) | TheHive + Cortex indexing. 1 GB heap, security disabled (localhost binding) |
+| TheHive | 5.7.1 (Docker `strangebee/thehive:5.7.1`) | 9000 | Case management UI + API. Reaches Cassandra/ES on 127.0.0.1 via `network_mode: host` |
+| Cortex | 4.0.1 (custom image `soc-cortex:4.0.1-analyzers`) | 9001 | Observable enrichment. Process mode, not docker-mode |
+| MISP | 2.5 (Docker stack) | 8443 (HTTPS), 8080 (HTTP) | Threat intelligence platform with feed auto-fetch |
+
+**Architectural deviation worth knowing:** StrangeBee killed `deb.strangebee.com` / `archives.strangebee.com` (DNS no longer resolves) — TheHive 5.x is no longer a .deb. The deployment shifted to Docker containers with `network_mode: host` so they can reach the native Cassandra + ES on 127.0.0.1. Cassandra (Apache repo) and the local Elasticsearch remain native apt installs because those channels are still public.
+
+**Cortex analyzer image is custom-built** (`soc-cortex:4.0.1-analyzers`) extending `thehiveproject/cortex:4.0.1`. Reason: docker-in-docker mode mounts the host's `/var/run/docker.sock` and the upstream entrypoint `chown 1001:1001`s it, locking `vboxuser` out of docker. Process mode + on-disk `Cortex-Analyzers/` (cloned at build time, 191 MB) is the durable fix. The image bakes in `cortexutils`, `pymisp`, `OTXv2`, `vt-py`, `python-magic`, `libmagic1`.
+
+**MISP port-binding deviation:** bound to `192.168.1.51:8080` / `192.168.1.51:8443` only — not `0.0.0.0`. ufw INPUT rules can't filter Docker-published ports (they live in the FORWARD chain), so restriction is enforced at the listener.
+
+**Critical service startup order** — never deviate or initialization fails:
+```
+cassandra      → wait 40s
+elasticsearch  → wait 20s
+thehive        → wait 30s
+cortex
+docker compose up -d   (MISP stack)
+```
+
+**What you do FROM VM_B1 day-to-day:**
+
+- Browse `http://192.168.1.51:9000` to triage cases (TheHive UI, login `admin@thehive.local` — changed from default `secret`, or `soc-bot@thehive.local` for analyst-scoped work).
+- Browse `http://192.168.1.51:9001` to inspect Cortex job results, configure analyzer instances, view organization users.
+- Browse `https://192.168.1.51:8443` to review MISP threat feeds, events, and attributes (login `admin@admin.test` — change on first login).
+- SSH in to run the polling bridges, inspect Cassandra (`nodetool status`), check Docker container logs, run the MISP feed cron script `~/soc-project/misp/cron-feeds.sh`.
+
+**Polling bridges that live here (because TheHive's native notifier did not dispatch initially and MISP has no native single-URL outbound webhook):**
+
+- `~/soc-project/thehive-cortex/cron-cases-to-wf2.sh` — every minute, queries `listCase` filter `_gt _createdAt`, posts each new case to `http://192.168.1.50:5678/webhook/thehive` in TheHive's native envelope shape (`{operation, objectType, objectId, object}`). Backup path since the native `CaseCreated` notifier was fixed on 2026-05-10.
+- `~/soc-project/misp/cron-publish-to-wf4.sh` — every minute, uses `/events/restSearch` with `publish_timestamp` filter, sends matching Event JSONs to `/webhook/misp`. First-run seeds state to "now" to avoid backfilling 1,606 historical feed events.
+- `~/soc-project/misp/cron-feeds.sh` — every 6 hours, docker-execs `cake Server fetchFeed/cacheFeed all`.
+
+### 2.3 VM_B2 — victim-lab (the deliberately-vulnerable target)
+
+| Field | Value |
+|---|---|
+| Hostname | `victim-lab` |
+| IP | `192.168.1.53` |
+| OS | Ubuntu 22.04 LTS (later upgraded — OpenSSH 9.x/10.x shipped from in-place upgrade visible in banner) |
+| Host PC | PC_B |
+| Role | Vulnerable target + network IDS |
+| RAM allocated | 3 GB min / 4 GB recommended |
+| Storage | 40 GB min |
+| ZeroTier node ID | `aa429ed844` (rejoined fresh after deauth/rejoin — original was VM_B1's cloned identity) |
+
+**What runs here:**
+
+| Service | Port | Purpose |
+|---|---|---|
+| Apache2 + PHP 8.5 | 80 | Web server hosting DVWA. `allow_url_include = On` |
+| MariaDB | 3306 | DVWA database |
+| vsftpd | 21 | FTP brute-force target |
+| OpenSSH | 22 | SSH brute-force target with three weak accounts |
+| Suricata | 8.0.3 | Network IDS on ZeroTier interface, 49,911 ET Open rules |
+| suricata-update | — | Daily ET ruleset auto-refresh at 03:00 |
+| Elastic Agent | →8220 | Ships host + Suricata + Apache logs to VM_A1 Fleet |
+
+**Intentional vulnerabilities (lab only):** DVWA at security level "low" exposes SQLi, XSS, CSRF, RFI, command injection, file upload. PHP `allow_url_include=On`. SSH password auth enabled. FTP local users enabled. **Weak test accounts:** `testuser1/password123`, `testuser2/admin`, `webadmin/webadmin`.
+
+**Active-response wiring (added 2026-05-07):** A locked-password user `soc-response` (uid 1004) exists. VM_A1's ed25519 public key sits in `/home/soc-response/.ssh/authorized_keys` (mode 600). `/etc/sudoers.d/soc-response` (mode 440) grants `soc-response ALL=(root) NOPASSWD: /usr/sbin/iptables, /sbin/iptables`. Both paths are listed because n8n's WF1 SSH node may invoke either. Verified working: when WF1 fires for a SOC-006 cmd-injection alert, the iptables `-I INPUT -s <attacker> -j DROP` rule lands successfully (rc=0).
+
+**SSH brute-force log shape fix (2026-05-08):** OpenSSH 9.x ships `PerSourcePenalties on` by default — repeated auth failures emit `drop connection ... penalty: failed authentication` lines that the Elastic Agent system integration does not parse to `event.outcome:"failure"`, so SOC-001 / SOC-002 KQL never matched. Patched with `PerSourcePenalties no` in `/etc/ssh/sshd_config.d/99-soc-lab.conf`. After the patch, repeated auth failures emit standard `Failed password` lines that the system integration parses correctly.
+
+**Elastic Agent integrations attached on this host (managed from VM_A1's Kibana → Fleet → victim-lab policy):** `system-2`, `apache-victim-lab` (reading `/var/log/apache2/access_soc.log` + `access.log` + `error.log`), `suricata-victim-lab` (reading `/var/log/suricata/eve.json`), `vsftpd-victim-lab` (Custom Logs on `/var/log/vsftpd.log` → dataset `vsftpd`). Native Suricata + Apache integrations are used (not Custom Logs) so logs arrive pre-parsed in ECS with prebuilt dashboards.
+
+**Apache extended log format `soc`** (defined in `/etc/apache2/conf-available/soc-logging.conf`) writes to `/var/log/apache2/access_soc.log` with timing (µs), bytes_in/out, query string, referer, UA, X-Forwarded-For. Owned `root:adm` so the agent can read it.
+
+**Suricata interface:** `ztdiyzommr` (ZeroTier interface — NOT `enp0s3` which is the VirtualBox NAT). HOME_NET covers `192.168.0.0/16`. 6 worker threads.
+
+**What you do FROM VM_B2 day-to-day:**
+
+- Mostly nothing — this VM exists to *be attacked*. Service health checks via `systemctl status apache2 mariadb vsftpd ssh.socket suricata elastic-agent`.
+- Tail `/var/log/suricata/eve.json` when validating that Suricata is seeing attacks.
+- Run `iptables -L INPUT -n` to confirm auto-block rules from WF1 actually landed. Clean them up after testing with `sudo /sbin/iptables -D INPUT -s <ip> -j DROP`.
+
+### 2.4 VM_A2 — kali-attacker (descoped)
+
+| Field | Value |
+|---|---|
+| Hostname | `kali-attacker` |
+| IP | `192.168.1.52` |
+| OS | Kali Linux |
+| Host PC | PC_A |
+| Role | Offensive testing — generates simulated attacks |
+| Status | **Descoped 2026-04-29** by user |
+
+Rationale: attack simulations can be launched from any reachable host (the user's own ZeroTier-joined laptop on `192.168.1.60`, or from VM_A1 itself), so a dedicated Kali VM is unnecessary scope for the PFE. Phase 6 is marked descoped. The VM exists physically but isn't part of the production pipeline. Tools that *would* be used if it were: `hydra`, `nmap`, `sqlmap`, `curl`, `msfconsole`, `scp`. Attack target endpoints stay: `ssh testuser1@192.168.1.53`, `http://192.168.1.53/dvwa`, `ftp://192.168.1.53`.
+
+**What you do FROM VM_A2:** in practice, launch ad-hoc curl / sqlmap / hydra attacks against VM_B2 during demo recordings. The Phase 10 cases #19 (SOC-006 cmd injection) and the SOC-012 chain were triggered from `192.168.1.52`, so the VM is functional even though it's not formally in scope.
+
+---
+
+## 3. Network and Connectivity
+
+### 3.1 ZeroTier overlay
+
+A **ZeroTier** virtual layer-2 network ID `cf719fd54008e4d1` (network name "my-first-network") creates a flat `192.168.1.0/24` subnet across both physical hosts. Every VM has the ZeroTier client installed, has joined this network, has been authorized in the ZeroTier admin console, and holds a stable IP on the auto-generated interface (`ztdiyzommr` on most VMs — exact name varies by node). ZeroTier was chosen over bridged networking because the two physical PCs may be on different physical networks (campus wifi, mobile hotspot) and cannot reliably reach each other through host-only or bridged adapters.
+
+Membership and reachability verified Phase 1:
+
+- `192.168.1.50` ↔ `192.168.1.51` round-trip ~7 ms over P2P when on the same host, ~174 ms cross-host via ZeroTier root
+- `192.168.1.51` ↔ `192.168.1.53` round-trip ~7 ms (same host PC_B)
+- `192.168.1.60` is the user's host laptop also joined to the ZT network — observed reaching TheHive's status API in early Phase 4 logs
+
+### 3.2 Port map
+
+Listening ports per VM (only ZT-subnet inbound is allowed via ufw, except where noted):
+
+| VM | Port | Protocol | Service | Notes |
+|---|---|---|---|---|
+| A1 .50 | 5000 | HTTP | ML Anomaly API | localhost-only (`127.0.0.1`), reached by n8n on same host |
+| A1 .50 | 5002 | HTTP | Correlation Engine | localhost-only, reached by n8n on same host |
+| A1 .50 | 5044 | TCP | Logstash beats input | open to ZT subnet |
+| A1 .50 | 5140 | TCP | Logstash syslog input | open to ZT subnet |
+| A1 .50 | 5601 | HTTP | Kibana | open to ZT subnet, HTTP (no TLS, lab) |
+| A1 .50 | 5678 | HTTP | n8n | open to ZT subnet, hosts 3 webhooks |
+| A1 .50 | 8220 | HTTPS (self-signed) | Fleet Server | open to ZT subnet, agents enroll `--insecure` |
+| A1 .50 | 9200 | HTTPS (self-signed) | Elasticsearch | open to ZT subnet, basic auth |
+| A1 .50 | 11434 | HTTP | Ollama | localhost-only, reached by n8n on same host |
+| B1 .51 | 7000 | TCP | Cassandra internal | localhost-only |
+| B1 .51 | 7199 | TCP | Cassandra JMX | localhost-only |
+| B1 .51 | 9042 | CQL | Cassandra | localhost-only (TheHive on host network reaches it) |
+| B1 .51 | 9200 | HTTP | local ES (TheHive/Cortex) | localhost-only |
+| B1 .51 | 9000 | HTTP | TheHive | open to ZT subnet |
+| B1 .51 | 9001 | HTTP | Cortex | open to ZT subnet |
+| B1 .51 | 8080 | HTTP | MISP | bound to `192.168.1.51:8080` only |
+| B1 .51 | 8443 | HTTPS (self-signed) | MISP | bound to `192.168.1.51:8443` only |
+| B2 .53 | 21 | FTP | vsftpd | open (lab target) |
+| B2 .53 | 22 | SSH | OpenSSH | open (lab target + active-response inbound) |
+| B2 .53 | 80 | HTTP | Apache (DVWA) | open (lab target) |
+| B2 .53 | 3306 | TCP | MariaDB | localhost (DVWA on host reaches it) |
+
+The 13 n8n webhooks live on three URLs:
+
+```
+http://192.168.1.50:5678/webhook/elastic-alert   ← WF1 (Kibana detection action)
+http://192.168.1.50:5678/webhook/thehive         ← WF2 (TheHive CaseCreated notifier)
+http://192.168.1.50:5678/webhook/misp            ← WF4 (MISP event publish bridge)
+```
+
+### 3.3 Service-to-service edges
+
+```
+Elastic Agent (B2)         → Fleet Server (A1:8220)        HTTPS, log/event shipping
+Suricata (B2)              → Elastic Agent (B2)            local file eve.json
+MISP feeds (CIRCL etc.)    → MISP (B1)                     HTTPS pull every 6h
+MISP (B1)                  → n8n WF4 (A1:5678/webhook/misp)  HTTP via 1-min polling bridge
+Kibana detection rules     → n8n WF1 (A1:5678/webhook/elastic-alert)  HTTP via .webhook connector
+n8n WF1                    → Correlation Engine (A1:5002)  HTTP localhost
+n8n WF1                    → ML API (A1:5000)              HTTP localhost
+n8n WF1, WF3, WF4          → Ollama (A1:11434)             HTTP localhost
+n8n WF1, WF2, WF3, WF4, WF5 → TheHive (B1:9000)             HTTP cross-VM
+n8n WF2                    → Cortex (B1:9001)              HTTP cross-VM
+n8n WF1                    → victim-lab SSH (B2:22)        SSH with ed25519 key
+n8n WF4, WF5               → Elasticsearch (A1:9200)       HTTPS localhost
+n8n WF4                    → Kibana (A1:5601)              HTTP localhost (rule import)
+TheHive (B1)               → n8n WF2 (A1:5678/webhook/thehive)  HTTP via native notifier + 1-min bridge fallback
+Correlation Engine         → Ollama (A1:11434)             HTTP localhost (optional, ambiguous-chain only — not used in Phase 10)
+ML API                     → Elasticsearch (A1:9200)       HTTPS localhost (training data fetch)
+```
+
+### 3.4 Firewall posture
+
+Every VM has `ufw` enabled with default deny incoming, allow outgoing, deny routed. Each VM has an `allow from 192.168.1.0/24 to any` rule that lets ZT-subnet peers reach all service ports. SSH from anywhere is allowed (future-proofing). On VM_B1 ports 9042 (Cassandra) and the local 9200 (ES) are not in the ufw allowlist because the services themselves bind to localhost only.
+
+ZeroTier's control port `9993/udp` is allowed from anywhere on all VMs so the overlay continues to function regardless of internet path.
+
+---
+
+## 4. The 5 n8n Workflows — Node-by-Node Walkthrough
+
+All five workflows live on VM_A1's n8n instance (`http://192.168.1.50:5678`), are owned by project `ZKstdJDMMM6gaT37` (Habib Kchaou's personal n8n project), are **active**, and are JSON-exported to `~/soc-project/n8n/workflows/`. They reference four n8n credentials:
+
+| Credential ID | Name | Type | Where it's used |
+|---|---|---|---|
+| `cTJMkUYUxWVtlD8K` | Elasticsearch (elastic) | httpBasicAuth | WF1 (ES + Kibana), WF4 (Kibana import), WF5 (ES health + count) |
+| `Ux32rgVuHoXKc1GY` | TheHive Bearer | httpHeaderAuth | WF1, WF2, WF3, WF4, WF5 (all case/comment/alert POSTs) |
+| `HK1qH743oIbnpSbk` | Cortex Bearer | httpHeaderAuth | WF2 (analyzer dispatch) |
+| `VqpfYno0QpnoseF6` | VM_B2 soc-response SSH | sshPrivateKey | WF1 (auto-block) |
+
+All five workflows set `saveExecutionProgress: true`, `saveDataSuccessExecution: all`, `saveDataErrorExecution: all` so every node's input and output is inspectable in the n8n UI for forensics. WF3 and WF5 set `timezone: Africa/Tunis` for cron alignment.
+
+### 4.1 Workflow 1 — Alert Pipeline
+
+| Field | Value |
+|---|---|
+| Workflow ID | `dKSF2AU9E3k9i25p` |
+| Name | `01 Alert Pipeline (Workflow 1)` |
+| Active | **yes** (activated 2026-05-09 22:25:26 UTC) |
+| Trigger | Webhook POST `/webhook/elastic-alert` |
+| Local export | `~/soc-project/n8n/workflows/01-alert-pipeline.json` |
+| Node count | 20 |
+
+**Plain-English purpose.** This is the main alert pipeline. Every time a Kibana detection rule fires it posts a small JSON envelope to this workflow's webhook. The workflow enriches the alert with the full document from Elasticsearch, looks up the rule's MITRE tags, asks the Correlation Engine whether this alert is a new case or a duplicate of an open one, branches accordingly, and for genuinely new cases it scores the alert with the ML model, summarizes it in plain English using Ollama, creates a TheHive case, attaches the source-IP as an observable, and (if the rule was marked critical) SSH'es into the victim VM and installs an iptables drop rule against the attacker.
+
+**Flow diagram.**
+
+```mermaid
+flowchart TD
+  A[Webhook Kibana alert] --> B[ES: fetch signals]
+  B --> C[Kibana: fetch rule definition]
+  C --> D[Build canonical payload]
+  D --> E[Correlation Engine: /correlate]
+  E --> F{Switch by action}
+  F -->|suppress| G[End: suppressed]
+  F -->|queue| H[End: queued for digest]
+  F -->|add_to_existing| I[TheHive: add to existing case]
+  F -->|escalate_existing| J[TheHive: escalate existing case]
+  F -->|create_new| K[ML: /score]
+  K --> L[Append anomaly score]
+  L --> M[Ollama: summarize]
+  M --> N[TheHive: create case]
+  N --> O[TheHive: add source_ip observable]
+  O --> P[Correlation Engine: set_case]
+  P --> Q{IF auto_block?}
+  Q -->|true| R[SSH: iptables block on VM_B2]
+  R --> S[TheHive: log auto-block]
+  Q -->|false| T[End: case created]
+```
+
+**Node-by-node walkthrough in execution order.**
+
+1. **`Webhook (Kibana alert)`** (`n8n-nodes-base.webhook`, `webhookId: elastic-alert-soc-pfe`). Listens for HTTP POSTs at `/webhook/elastic-alert`. The Kibana SIEM action sends a small JSON body shaped `{"rule_id":"SOC-006","rule_name":"…","severity":"high","risk_score":73,"auto_block":true,"results_link":"…"}`. n8n nests webhook input under `.body`, so downstream nodes read `$('Webhook (Kibana alert)').item.json.body.rule_id`.
+
+2. **`ES: fetch signals`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `https://192.168.1.50:9200/.alerts-security.alerts-default/_search` with `httpBasicAuth` (credential `cTJMkUYUxWVtlD8K`). Body queries the alerts index for the last 5 hits of the firing `rule_id` within the last 15 minutes, sorted descending by timestamp. `allowUnauthorizedCerts: true` because the cluster cert is self-signed. `neverError: true` so a partial result doesn't abort the workflow. Output: full Elasticsearch search response with `hits.hits[]._source` containing the alert documents.
+
+3. **`Kibana: fetch rule definition`** (`n8n-nodes-base.httpRequest` v4.2). GETs `http://192.168.1.50:5601/api/detection_engine/rules?rule_id={{...body.rule_id}}` with the same Elasticsearch basic auth credential and `kbn-xsrf: soc` header. This pulls the full rule object so the next node can read `threat[0].tactic.id` and `threat[0].technique[0].id` — values that aren't reliably templatable through Kibana's mustache action body. Output: the rule definition including the MITRE `threat[]` array.
+
+4. **`Build canonical payload`** (`n8n-nodes-base.set` v3.4). Eleven assignments that produce a flat, consistent payload from the previous three nodes' messy inputs:
+   - `rule_id`, `rule_name` from the webhook body
+   - `severity` defaulted to `'medium'` if missing
+   - `risk_score` numeric-coerced, default 50
+   - `auto_block` boolean-coerced from string-or-boolean
+   - `results_link` defaulted to empty string
+   - `source_ip` — the hard one. An inline IIFE walks the ES first-hit `_source` looking for an IPv4 in `kibana.alert.threshold_result.terms[0].value`, then `source.ip`, then `host.ip`, then falls back to `'unknown'`. The function `pickIp(v)` handles three input shapes: plain string IP, JSON-encoded array (`'["10.0.0.1","::1"]'`), and real array. It prefers the first non-loopback IPv4 it finds, otherwise the first string. **This is bug fix #5 from Phase 10 (2026-05-10)** — without it, when an alert host has multiple NICs (e.g. B2 has 5 IPs across lo/ZT/IPv6), the array would serialize as JSON-string-of-array and break downstream TheHive create-case JSON body interpolation.
+   - `mitre_tactic_id` from `threat[0].tactic.id` or empty
+   - `mitre_technique_id` — prefers `subtechnique[0].id` if present, otherwise `technique[0].id`
+   - `alert_count` from `hits.total.value`
+   - `first_signal_id` from `hits.hits[0]._id`
+
+5. **`Correlation Engine: /correlate`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `http://127.0.0.1:5002/correlate` (localhost — same host as n8n) with body:
+   ```json
+   {"source_ip": "...", "rule_id": "...", "mitre_tactic_id": "...",
+    "mitre_technique_id": "...", "severity": "...", "anomaly_score": 0.0,
+    "auto_block": ...}
+   ```
+   The Flask Correlation Engine looks at its SQLite state (30-min same-`(source_ip, rule_id)` bucket window, 2-hour cross-tactic kill-chain window, whitelist for known-good IPs) and returns `{"action": "create_new"|"add_to_existing"|"escalate_existing"|"suppress"|"queue", "bucket_id": int, "case_id": str, "chain_detected": {...}}`. The `anomaly_score` is sent as 0 here because the ML score hasn't been computed yet — the engine's correlation logic doesn't depend on it.
+
+6. **`Switch by action`** (`n8n-nodes-base.switch` v3.2). Five outputs by exact string match on `$json.action`:
+   - `suppress` → output 0 (whitelisted source, drop the alert)
+   - `queue` → output 1 (low-signal alert, hold for daily digest)
+   - `add_to_existing` → output 2 (same `(ip, rule)` bucket within 30 min)
+   - `escalate_existing` → output 3 (new MITRE tactic from same source within 2 h, kill-chain progression)
+   - `create_new` → output 4 (fresh incident)
+   - fallback: `none` (no path taken — defensive)
+
+7. **`End: suppressed`** (`n8n-nodes-base.noOp` v1). Terminal node. The alert is intentionally dropped.
+
+8. **`End: queued for digest`** (`n8n-nodes-base.noOp` v1). Terminal node. The Correlation Engine has noted this bucket and WF3 will pick it up at 8:00 AM.
+
+9. **`TheHive: add to existing case`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `http://192.168.1.51:9000/api/v1/case/{case_id}/comment` with `httpHeaderAuth` (TheHive Bearer credential `Ux32rgVuHoXKc1GY`). Body is a free-text comment summarizing "+1 alert from {source_ip} (rule {rule_id} - {rule_name}; bucket alert_count={n}) at {ISO timestamp}". `retryOnFail: true, maxTries: 3, waitBetweenTries: 5000` — if TheHive is briefly unresponsive (e.g. boot delay), the comment retries.
+
+10. **`TheHive: escalate existing case`** (`n8n-nodes-base.httpRequest` v4.2). Same shape as the add-comment node but the message text is "KILL-CHAIN ESCALATION at {ISO} from {ip}. New tactic: {tactic} ({technique}). Triggering rule: ... Prior tactics in chain: {JSON-stringified array}. bucket alert_count=…". The Correlation Engine has detected a new MITRE tactic for the same source within the 2-hour kill-chain window. The comment carries the chain history for the analyst.
+
+11. **`ML: /score`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `http://127.0.0.1:5000/score` (localhost Flask ML API). Body is a flat dict of `rule_id`, `source_ip`, `severity`, `risk_score`, `mitre_tactic_id`, `mitre_technique_id`. Returns `{"anomaly_score": float, "is_anomaly": bool, "model": "IsolationForest"}`. `neverError: true` so a missing-model situation doesn't abort.
+
+12. **`Append anomaly score`** (`n8n-nodes-base.set` v3.4). Three assignments: `anomaly_score` (numeric, default 0), `is_anomaly` (boolean coerced from exact `=== true`), and `bucket_id` (pulled forward from the `/correlate` response). This separates the ML output from downstream node names so subsequent nodes can read `$('Append anomaly score').item.json.anomaly_score` deterministically.
+
+13. **`Ollama: summarize`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `http://127.0.0.1:11434/api/generate` (localhost Ollama). Body:
+    ```json
+    {"model": "llama3.1:8b",
+     "prompt": "You are a SOC L1 analyst. Summarize this security alert in 2 short sentences for an incident report. Be factual, no speculation. Alert: rule=... ...",
+     "stream": false,
+     "options": {"temperature": 0.3, "num_predict": 30}}
+    ```
+    `num_predict: 30` keeps generation to ~30 tokens which at the host's CPU-only ~0.3 tok/s rate takes ~100s warm, ~200s+ cold. `timeout: 600000` (10 min) provides headroom. `continueOnFail: true` — if Ollama is unreachable, the next node uses the fallback string "Ollama unavailable — analyst review required.".
+
+14. **`TheHive: create case`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `http://192.168.1.51:9000/api/v1/case` with the TheHive Bearer. JSON body builds the full case:
+    - `title`: `[SOC-NNN] {rule_name} from {source_ip}`
+    - `description`: a multi-line string with the AI summary (newlines stripped via `.replace(/\n/g,' ')` on the AI text), then a structured block listing source IP, rule, MITRE, severity, risk score, anomaly score, alert count, auto-block flag, and Kibana deep link
+    - `severity`: numeric `4|3|2|1` mapped from `critical|high|medium|low` via an inline lookup dict, default 2
+    - `tags`: `["PFE", "SOC-Lab", "{rule_id}", "mitre:{tactic}", "mitre:{technique}"]`
+    - `flag`: true only when severity is `critical`
+    `retryOnFail: true, maxTries: 3, waitBetweenTries: 5000`. Output: TheHive returns the new case object including `_id` (the case GUID) — that ID is referenced by the next two nodes.
+
+15. **`TheHive: add source_ip observable`** (`wf1-14b-add-observable`, `n8n-nodes-base.httpRequest` v4.2). Added in Phase 10 (2026-05-10) as part of bug fix #7. POSTs to `http://192.168.1.51:9000/api/v1/case/{case._id}/observable` with body:
+    ```json
+    {"dataType": "ip", "data": "{source_ip}", "tlp": 2, "pap": 2, "ioc": true,
+     "sighted": true, "message": "Source IP from {rule_id} ({rule_name})",
+     "tags": ["soc-auto", "source.ip"]}
+    ```
+    This creates a proper Observable on the case so that WF2's Cortex enrichment has something to look up. Without this, the case would have a description mentioning the IP but no `Observable` record for Cortex to operate on. The `tlp: 2`/`pap: 2` values are TheHive's amber-traffic-light defaults; `ioc: true, sighted: true` mark the IP as a confirmed indicator of compromise that has been seen in the wild here.
+
+16. **`Correlation Engine: set_case`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `http://127.0.0.1:5002/correlate/set_case` with `{"bucket_id": ..., "case_id": "..."}`. Tells the engine to associate the freshly-created TheHive case ID with the bucket it returned earlier so future alerts in the same bucket land as `add_to_existing` against that case.
+
+17. **`IF auto_block?`** (`n8n-nodes-base.if` v2.2). Reads `$('Build canonical payload').item.json.auto_block` boolean. `looseTypeValidation: true` accepts truthy values. True branch → SSH block node; false branch → noOp end.
+
+18. **`SSH: iptables block on VM_B2`** (`n8n-nodes-base.ssh` v1). `authentication: privateKey` (this explicit parameter is mandatory or activation errors — bug found and fixed during early Phase 8). Uses the `VqpfYno0QpnoseF6` sshPrivateKey credential — the `soc_response` ed25519 key on VM_A1's `~/.ssh/`. Connects to `192.168.1.53:22` as user `soc-response`. Command: `sudo /sbin/iptables -I INPUT -s {source_ip} -j DROP`. The sudoers file on B2 grants NOPASSWD for both `/sbin/iptables` and `/usr/sbin/iptables` because Ubuntu symlinks both to `/etc/alternatives/iptables`. `continueOnFail: true` so a network blip doesn't kill the workflow.
+
+19. **`TheHive: log auto-block`** (`n8n-nodes-base.httpRequest` v4.2). POSTs a comment to the case explaining: "Auto-block executed: iptables -I INPUT -s {ip} -j DROP on victim-lab (192.168.1.53). Triggered by rule {rule_id} (severity {severity})." Closes the audit trail. `retryOnFail: true, maxTries: 3`.
+
+20. **`End: case created (no auto-block)`** (`n8n-nodes-base.noOp` v1). Terminal node for the non-critical branch.
+
+**How this workflow fits into the SOC pipeline.** WF1 is the central artery — *every* Kibana detection rule, custom or prebuilt, that ships an alert to Kibana's `.webhook` connector lands here. It is the single decision point that determines whether the alert becomes a case, joins an existing case, escalates an open case, or gets dropped. Every TheHive case the analyst sees in normal operation was created through WF1 (the exceptions are the digest, maintenance, and AI-rule-generation cases created by WF3, WF5, and WF4).
+
+**Failure modes:**
+
+- **Kibana action variables wrong.** The action body template must use `rule.params.ruleId`, `rule.params.severity`, `rule.params.riskScore` — *not* `rule.rule_id` etc. (those mustache variables don't exist in summary mode). If wrong, every field renders empty and the JSON body becomes malformed (`"risk_score":,`). Symptom: ES fetch returns 0 hits, TheHive create returns 400 BadRequest. Fix: bulk-patch all 13 rules' action body via `PATCH /api/detection_engine/rules`. (Phase 10 bug #2 root cause; bulk-fixed 2026-05-07.)
+- **`source_ip` is a JSON-string-of-array.** When the alert host has multiple NICs the array would break the downstream TheHive create JSON body interpolation. Symptom: TheHive create returns 400 "Bad request". Fix: the IIFE in `Build canonical payload` (Phase 10 bug #5).
+- **Ollama timeout.** On cold load Ollama can take 5 minutes to mmap the model into RAM. `continueOnFail: true` means the create-case node still runs but with the fallback string. The case lands with description "Ollama unavailable — analyst review required.".
+- **TheHive bearer expired or wrong.** Returns 401. The case-create node retries 3 times then fails the execution. Recovery: paste a fresh bearer into n8n credential `Ux32rgVuHoXKc1GY`.
+- **VM_B1 down.** The TheHive create-case node's host is unreachable. Workflow retries 3 times then fails. The Correlation Engine bucket is still created (the previous nodes succeeded), so once B1 is back, a follow-up alert from the same source within 30 min will land in `add_to_existing` — but with `case_id: null` it will 404. Recovery: close stale buckets via `POST :5002/close {"bucket_id": N}`.
+- **VM_B2 down or `soc-response` key not authorized.** SSH node returns non-zero. `continueOnFail: true` lets the workflow continue but the iptables block didn't actually fire; the auto-block log comment is then misleading because it claims success. Mitigation: the log comment node text could be made conditional on SSH rc=0 in a future hardening pass.
+
+### 4.2 Workflow 2 — Cortex Enrichment
+
+| Field | Value |
+|---|---|
+| Workflow ID | `HYiSFNStG5zEG6ZA` |
+| Name | `02 Cortex Enrichment (Workflow 2)` |
+| Active | **yes** (last activated 2026-05-10 22:23:29 UTC) |
+| Trigger | Webhook POST `/webhook/thehive` |
+| Local export | `~/soc-project/n8n/workflows/02-cortex-enrichment.json` |
+| Node count | 11 |
+
+**Plain-English purpose.** When TheHive creates a new case, this workflow fires. It pulls every observable on the case, sorts them by `dataType` (IP, file hash, URL, or other), and dispatches each to the right Cortex analyzer (AbuseIPDB for IPs, VirusTotal for hashes and URLs). Reports come back asynchronously into Cortex and link themselves into TheHive's observable view, so the analyst sees enrichment results on each observable without doing anything.
+
+**Flow diagram.**
+
+```mermaid
+flowchart TD
+  A[Webhook TheHive] --> B{IF case-create event}
+  B -->|true| C[TheHive: fetch observables]
+  B -->|false| Z[End: ignored]
+  C --> D[Loop observables batchSize 1]
+  D -->|after last| E[TheHive: log enrichment dispatched]
+  D -->|each item| F{Switch by dataType}
+  F -->|ip| G[Cortex: AbuseIPDB]
+  F -->|hash| H[Cortex: VirusTotal hash]
+  F -->|url| I[Cortex: VirusTotal URL]
+  F -->|other| J[Skip: unsupported]
+  G --> D
+  H --> D
+  I --> D
+  J --> D
+```
+
+**Node-by-node walkthrough.**
+
+1. **`Webhook (TheHive)`** (`n8n-nodes-base.webhook`, `webhookId: thehive-soc-pfe`, path `/webhook/thehive`, `responseMode: onReceived`, `responseData: {"received": true}`). Receives the case event envelope. TheHive's native notifier dispatches `{operation, objectType, objectId, object}` once a `CaseCreated` trigger fires (post-fix 2026-05-10). The polling bridge `cron-cases-to-wf2.sh` on VM_B1 mimics the same shape every minute for resilience.
+
+2. **`IF case-create event`** (`n8n-nodes-base.if` v2.2). Checks whether `$json.body.operation || $json.body.action` *contains* the string `"create"` (loose match). Filters out updates, deletes, comments. True → continue; false → noOp end node `wf2-11-noop-not-create`.
+
+3. **`TheHive: fetch observables`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to TheHive's query API `http://192.168.1.51:9000/api/v1/query` with the TheHive Bearer. Body:
+   ```json
+   {"query": [
+     {"_name": "getCase", "idOrName": "{objectId || object[0]._id || object._id}"},
+     {"_name": "observables"}
+   ]}
+   ```
+   **This is bug fix #7 from Phase 10 (2026-05-10).** The original GET to `/api/v1/case/{id}/observables` returns 404 silently on TheHive 5 — that endpoint doesn't exist. Cortex enrichment had been silently broken since the start of the project. Output: an array of observable objects each with `dataType`, `data`, `tlp`, etc.
+
+4. **`Loop observables (batchSize 1)`** (`n8n-nodes-base.splitInBatches` v3). Iterates the observable array one at a time. n8n's splitInBatches has two outputs: output 0 is the post-loop "done" branch, output 1 is the per-item branch.
+
+5. **`TheHive: log enrichment dispatched`** (`n8n-nodes-base.httpRequest` v4.2). Connected to splitInBatches output 0 (post-loop). POSTs a comment to the same case: "Auto-enrichment dispatched: {totalItems} observables sent to Cortex (AbuseIPDB / VirusTotal). Reports will appear on each observable as Cortex jobs complete."
+
+6. **`Switch by dataType`** (`n8n-nodes-base.switch` v3.2). Connected to splitInBatches output 1 (per-item). Routes by exact match on `dataType`:
+   - `ip` → output 0 → AbuseIPDB analyzer
+   - `hash` → output 1 → VirusTotal hash
+   - `url` → output 2 → VirusTotal URL
+   - anything else → fallback output `other` → skip noOp
+   `looseTypeValidation: true`.
+
+7. **`Cortex: AbuseIPDB`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `http://192.168.1.51:9001/api/analyzer/6b1c7570c74b55db697a69aa2c719b4f/run` — note the path uses the **analyzer instance UUID** `6b1c7570c74b55db697a69aa2c719b4f`, not the definition id `AbuseIPDB_2_0`. This is the fix for Bug A1-#1: WF2 originally called `AbuseIPDB_1_0` (definition id with wrong version suffix) which returns 404. Body:
+   ```json
+   {"data": "{observable.data}", "dataType": "ip", "tlp": 2,
+    "message": "Auto-enrichment from n8n WF2 for TheHive case observable"}
+   ```
+   Cortex Bearer credential `HK1qH743oIbnpSbk`. Analyzer runs asynchronously (Cortex queues a Python job) and writes results back to TheHive via TheHive's link with Cortex.
+
+8. **`Cortex: VirusTotal hash`** (`n8n-nodes-base.httpRequest` v4.2). Same shape, analyzer UUID `8cac1902c2e7879f2d258a3bfc7ba1f5`, `dataType: "hash"`. Note this is the VirusTotal_GetReport_3_1 instance — the same UUID is reused for hashes and URLs because VirusTotal handles both data types.
+
+9. **`Cortex: VirusTotal URL`** (`n8n-nodes-base.httpRequest` v4.2). Same UUID as the hash node, `dataType: "url"`.
+
+10. **`Skip: unsupported dataType`** (`n8n-nodes-base.noOp` v1). For observables that aren't ip/hash/url (e.g. `email`, `domain`, `filename`, `regexp`) — silently passes through.
+
+11. **`End: ignored (not a case-create event)`** (`n8n-nodes-base.noOp` v1). Terminal for the false branch of the IF gate.
+
+**Loop wiring detail.** Each of nodes 7, 8, 9, 10 connects *back* to `Loop observables` so the splitInBatches node iterates the next observable. When the array is exhausted, splitInBatches emits on output 0 → log node.
+
+**How this workflow fits into the SOC pipeline.** WF2 is the second-stage automated investigation. WF1 builds the case and attaches the source IP as an observable; WF2 then fans the observable out to threat-intelligence analyzers and writes their findings back. By the time an analyst opens the TheHive case, they see (within seconds for AbuseIPDB, ~30 s for OTXQuery) whether the IP is known-malicious, what the AbuseIPDB confidence score is, whether VirusTotal flags any URL hits.
+
+**Failure modes:**
+
+- **Analyzer instance UUID mismatch.** If you redeploy Cortex or the analyzer set, the UUIDs change and the hardcoded paths return 404. The current snapshot has the live UUIDs from VM_B1's 2026-05-10 verification. If they change, look them up via `GET /api/analyzer` and patch the HTTP URLs.
+- **AbuseIPDB worker not registered.** The analyzer **instance** is configured in Cortex's UI, but if the user's free-tier API key isn't set in the org configuration, the worker isn't registered and Cortex logs `worker AbuseIPDB_2_0 not found`. Cortex returns a job_id but the job errors out. Fix: SOC-LAB org → Analyzers → enable AbuseIPDB_2_0 with key.
+- **OTXQuery hang.** Pre-2026-05-10 OTXQuery had no HTTP timeout and ran `passive_dns` + `url_list` queries that for popular IPs (e.g. 8.8.8.8) return millions of records. Patched on the host's `Cortex-Analyzers/analyzers/OTXQuery/otxquery.py` to drop those two sections and apply `timeout=15` on all four `requests.get` callsites with per-section error isolation. (Details in Section 5.4.) WF2 doesn't dispatch OTXQuery in the current snapshot (no node references that analyzer's UUID `eb540d51238c71257ca2713bafd84d2e`), but if added later it now returns within ~30 s.
+- **TheHive query API 404.** Pre-bug-#7 fix the workflow used `GET /case/{id}/observables` which is not a TheHive 5 endpoint. The Switch saw `dataType: undefined` for every iteration and routed everything to `Skip: unsupported dataType`. Symptom: no Cortex jobs ever appeared on cases. Fix: POST `/api/v1/query` with the `getCase + observables` pipeline.
+
+### 4.3 Workflow 3 — Daily Digest
+
+| Field | Value |
+|---|---|
+| Workflow ID | `Z1VpjJlhg2Skek1B` |
+| Name | `03 Daily Digest (Workflow 3)` |
+| Active | **yes** (activated 2026-05-10 22:18:55 UTC) |
+| Trigger | Schedule cron `0 8 * * *` (daily 08:00 Africa/Tunis) |
+| Local export | `~/soc-project/n8n/workflows/03-daily-digest.json` |
+| Node count | 7 |
+
+**Plain-English purpose.** Every morning at 08:00 local time, this workflow asks the Correlation Engine for all open buckets that haven't been promoted to a TheHive case (i.e. buckets in the `queue` state from low-signal alerts), summarizes them with an LLM digest, creates a single TheHive case `[DAILY-DIGEST] YYYY-MM-DD — N queued buckets / M alerts`, and then closes the buckets so they don't re-appear tomorrow. The point is to surface low-priority alerts to the analyst once a day instead of one-by-one as they happen.
+
+**Flow diagram.**
+
+```mermaid
+flowchart TD
+  A[Daily 08:00 schedule] --> B[Correlation Engine: /state]
+  B --> C[Aggregate queued buckets]
+  C --> D[Ollama: digest summary]
+  D --> E[TheHive: create digest case]
+  E --> F[Fan out bucket IDs]
+  F --> G[Correlation Engine: /close bucket]
+```
+
+**Node-by-node walkthrough.**
+
+1. **`Daily 08:00`** (`n8n-nodes-base.scheduleTrigger` v1.2). Cron expression `0 8 * * *` interpreted in the workflow's `Africa/Tunis` timezone setting. Emits an empty item once a day.
+
+2. **`Correlation Engine: /state`** (`n8n-nodes-base.httpRequest` v4.2). GETs `http://127.0.0.1:5002/state`. The engine returns `{"buckets": [{bucket_id, rule_id, source_ip, alert_count, max_severity, closed, case_id, ...}, ...]}` — every bucket the engine knows about.
+
+3. **`Aggregate queued buckets`** (`n8n-nodes-base.code` v2). JavaScript that:
+   - filters to `!b.closed && b.case_id == null` (open queued buckets — alerts that didn't create cases)
+   - if empty, returns `[]` so the workflow ends cleanly
+   - sums `alert_count` across all open buckets
+   - tallies `byRule[r] = sum(alert_count)` to produce a per-rule breakdown
+   - builds a multi-line `lines` string with one bullet per bucket: `- bucket {id} | rule {rule_id} | ip {ip} | alerts {n} | sev {max_severity}`
+   - builds a comma-separated `byRuleLine` string
+   Outputs one item: `{open_count, total_alerts, by_rule, lines, bucket_ids}`.
+
+4. **`Ollama: digest summary`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `http://127.0.0.1:11434/api/generate` with `llama3.1:8b`, `num_predict: 80`, `temperature: 0.3`. Prompt: "Write a 3-sentence SOC daily digest for an L1 analyst. Include the most-frequent rules and what action to consider. Buckets: {lines}. By rule: {by_rule}. Total alerts: {total_alerts} across {open_count} buckets." `continueOnFail: true`, 600 s timeout.
+
+5. **`TheHive: create digest case`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to TheHive's case-create endpoint with the TheHive Bearer. Title: `[DAILY-DIGEST] {yyyy-LL-dd} — {open_count} queued buckets / {total_alerts} alerts`. Description: 3 sections separated by `--- ---` lines — AI summary, By rule, Buckets. **Each interpolated field is wrapped in `String(...)` and `.replace(/[\x00-\x1f]/g, ' ')`** to strip control characters and avoid JSON-body interpolation crashes — this is the Bug A1-#2 mitigation. Severity 1 (low), tags `["PFE","SOC-Lab","daily-digest","automated"]`, `flag: false`.
+
+6. **`Fan out bucket IDs`** (`n8n-nodes-base.code` v2). Pulls `bucket_ids` from `Aggregate queued buckets` and emits one item per bucket: `[{bucket_id: 1}, {bucket_id: 2}, ...]`. n8n runs the next node once per emitted item.
+
+7. **`Correlation Engine: /close bucket`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `http://127.0.0.1:5002/close` with `{"bucket_id": N}` for each fanned-out item. Marks the bucket closed in SQLite so it doesn't reappear in tomorrow's digest.
+
+**How this workflow fits into the SOC pipeline.** WF3 is the relief valve for the alert-fatigue problem. The Correlation Engine's `queue` action specifically routes low-severity, low-anomaly alerts into the bucket without creating a case — they accumulate over the day. WF3 batches them into one daily digest case so the analyst can review them as a group, decide whether anything warrants attention, and move on. This is the second half of the "1 attack = 1 case" goal: the first half is correlation merging redundant high-signal alerts into one case; the second half is digest batching low-signal alerts so they don't drown the analyst.
+
+**Failure modes:**
+
+- **JSON control-character crash (Bug A1-#2, exec 274 on 2026-05-10 07:00 UTC).** Before the latest snapshot, the description template interpolated `lines` and `by_rule` directly. If a `rule_name` or other bucket field contained a literal newline or tab, n8n's JSON body interpolation failed with `Bad control character in string literal at position 280`. Fix: the `.replace(/[\x00-\x1f]/g,' ')` wrapper now applied to every interpolated field. Verified in the current `wf3-05-thehive-create` node.
+- **Ollama silent-fail wrapped into output (Bug A1-#2 secondary).** Because the Ollama node has `neverError: true` and `continueOnFail: true`, when Ollama itself errors it wraps the error object into `$json` and downstream `$json.response` is the wrong shape. Recommended hardening: add an `If` node between Ollama and TheHive that short-circuits on missing `$json.response` and uses a fallback summary string.
+- **Historical "host unreachable" (exec 253 on 2026-05-08 07:00).** TheHive was offline due to the 6-hour ES outage on B1. Resolved permanently by the boot orchestration fix on 2026-05-10. Not a standing issue.
+- **Empty digest.** If no buckets are queued, `Aggregate queued buckets` returns `[]` and the workflow ends without creating a TheHive case — by design.
+
+### 4.4 Workflow 4 — MISP → AI Rule Generation
+
+| Field | Value |
+|---|---|
+| Workflow ID | `SbXmkucPC24njKwb` |
+| Name | `04 MISP -> AI Rule Gen (Workflow 4)` |
+| Active | **yes** (activated 2026-05-06 14:36:20 UTC) |
+| Trigger | Webhook POST `/webhook/misp` |
+| Local export | `~/soc-project/n8n/workflows/04-misp-rule-gen.json` |
+| Node count | 8 |
+
+**Plain-English purpose.** When MISP publishes a new threat-intelligence event (e.g. CIRCL or Abuse.ch issues fresh IOCs), the polling bridge on VM_B1 posts the event JSON to this webhook. The workflow extracts up to 30 attributes, picks out IPs, URLs/domains, and file hashes, asks Ollama in JSON-output mode to generate a Kibana detection rule that watches `logs-*` for any of those indicators, validates the LLM output, assembles a Kibana rule NDJSON object (disabled by default for analyst review), pushes it to Kibana's detection-engine import API, and logs an alert in TheHive announcing the new rule. If the LLM output can't be parsed, logs a different alert in TheHive saying "manual rule authoring required".
+
+**Flow diagram.**
+
+```mermaid
+flowchart TD
+  A[Webhook MISP event] --> B[Extract indicators]
+  B --> C[Ollama: generate rule JSON]
+  C --> D[Validate + assemble NDJSON]
+  D --> E{IF Ollama output valid}
+  E -->|true| F[Kibana: import generated rule]
+  F --> G[TheHive: log AI-generated rule]
+  E -->|false| H[TheHive: log generation failure]
+```
+
+**Node-by-node walkthrough.**
+
+1. **`Webhook (MISP event)`** (`n8n-nodes-base.webhook`, path `/webhook/misp`, `webhookId: misp-soc-pfe`, `responseMode: onReceived`, `responseData: {"received":true}`). The bridge `cron-publish-to-wf4.sh` on VM_B1 posts each newly-published MISP Event JSON here.
+
+2. **`Extract indicators`** (`n8n-nodes-base.code` v2). JavaScript that:
+   - reads `body.Event || body.event || body` defensively (MISP wraps the event differently depending on call shape)
+   - takes the first 30 attributes
+   - filters IPs via `/^ip-(src|dst)$/` regex
+   - filters URLs via `type === 'url' || type.startsWith('domain')`
+   - filters hashes via `/^(md5|sha1|sha256)$/`
+   - reads `event.info || event.title` for the human title
+   - reads `event.Tag || event.tags` for MITRE / kill-chain tags
+   - caps each list at 10 items to keep the LLM prompt size sane
+   Outputs `{event_id, info, tags, ips, urls, hashes, ip_count, url_count, hash_count}`.
+
+3. **`Ollama: generate rule (JSON)`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `http://127.0.0.1:11434/api/generate` with `llama3.1:8b`, `format: "json"` (Ollama-side guarantee of JSON output), `num_predict: 400`, `temperature: 0.2`. Prompt:
+   > "You generate Kibana detection rules. Output ONLY a JSON object with these exact keys: name (string), description (string), severity (low|medium|high|critical), risk_score (int 1-99), query (KQL string querying logs-* index for any of the given indicators in source.ip, destination.ip, url.original, file.hash.* fields), tactic_id (TA0XXX), technique_id (T1XXX), tags (array of strings). Use ONLY indicators below; do not invent any. Indicators: IPs={...}; URLs={...}; Hashes={...}. MISP event title: {info}. MISP tags: {tags}."
+
+   `continueOnFail: true`, 600 s timeout. **Note from CLAUDE.md: at CPU-only ~0.3 tok/s, 400 tokens of JSON takes ~22 min and exceeds the 10-min timeout. The smoke test in Phase 9 confirmed Ollama returned empty within timeout, the validator correctly routed to the failure log branch — the workflow handles this gracefully, but real-world success requires either GPU Ollama or dropping `num_predict` to 150.**
+
+4. **`Validate + assemble NDJSON`** (`n8n-nodes-base.code` v2). JavaScript that:
+   - tries `JSON.parse(items[0].json.response)`
+   - if parse fails or the parsed object lacks `query`, returns `{ok: false, reason: 'Ollama did not return parseable JSON', raw: resp.slice(0,200)}`
+   - if valid, builds a complete Kibana detection rule object with:
+     - `rule_id: "MISP-AI-{event_id}-{Date.now()}"` (collision-proof)
+     - `name: "[AUTO] {draft.name || event.info}"` truncated to 200 chars
+     - `description` truncated to 1000 chars
+     - `type: "query"`, `language: "kuery"`
+     - `query`: the LLM-supplied KQL
+     - `index: ["logs-*", "filebeat-*", ".alerts-security.alerts-default"]`
+     - `severity` validated against the allowed set, default `"medium"`
+     - `risk_score` validated 1-99, default 50
+     - `max_signals: 100`, `interval: "10m"`, `from: "now-11m"`, `to: "now"`
+     - `tags: ["PFE", "SOC-Lab", "MISP-AI-generated", "mitre:TA0XXX", "mitre:T1XXX"]` plus up to 5 LLM-supplied tags
+     - `threat[]` with framework MITRE ATT&CK, the LLM-supplied tactic and technique
+     - `meta: {auto_block: false, soc_layer: 'misp-ai', soc_id: rule_id, source_event: event_id}`
+     - **`enabled: false`** — the deliberate analyst-in-the-loop guardrail against LLM hallucinations producing over-broad queries
+   Outputs `{ok: true, rule_id, kibana_rule_ndjson: JSON.stringify(rule), draft}`.
+
+5. **`IF Ollama output valid`** (`n8n-nodes-base.if` v2.2). Branches on `$json.ok === true`.
+
+6. **`Kibana: import generated rule`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `http://192.168.1.50:5601/api/detection_engine/rules/_import?overwrite=true` with `httpBasicAuth` (the Elasticsearch credential) and `kbn-xsrf: soc` header. `contentType: multipart-form-data`, body parameter `file` of type `formBinaryData` reading from input field `data`. Kibana ingests the NDJSON and creates the rule disabled. `neverError: true` so a duplicate rule_id doesn't abort.
+
+7. **`TheHive: log AI-generated rule`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `http://192.168.1.51:9000/api/v1/alert` (note: TheHive 5 `alert` API, not `case` — this is technically an *Alert* in TheHive's vocabulary, distinct from a Case). Body: `{type: "misp-ai-rule", source: "n8n-WF4", sourceRef: "{rule_id}", title: "[MISP-AI] New detection rule deployed: ...", description: "AI-generated Kibana rule deployed (disabled by default for analyst review). MISP event: ... Draft rule: {full NDJSON}", severity: 2, tlp: 2, tags: ["PFE","automated","misp-ai-rule"]}`. The analyst then sees the alert in TheHive, reviews the rule, and either enables it in Kibana or drops it.
+
+8. **`TheHive: log generation failure`** (`n8n-nodes-base.httpRequest` v4.2). Connected to the false branch. POSTs an alert with `type: "misp-ai-rule-failed"`, `sourceRef: "misp-{event_id}"`, severity 1, description `"Ollama did not return parseable JSON. Reason: {reason}. Raw (first 200 chars): {raw}. Manual rule authoring required."`.
+
+**How this workflow fits into the SOC pipeline.** WF4 is the adaptive-intelligence loop. The SOC's detection coverage grows automatically as new threats emerge — every fresh MISP event becomes a draft Kibana rule. The analyst-in-the-loop `enabled: false` gate means hallucinated/overly-broad rules don't silently start firing; the analyst reviews each draft, edits if needed, and toggles enabled. This is also the workflow that most clearly demonstrates the "original work" aspect of the PFE: zero manual rule writing for new IOC feeds.
+
+**Failure modes:**
+
+- **Ollama timeout (the main caveat).** 400 tokens at ~0.3 tok/s ≈ 22 min, exceeds the 10-min HTTP timeout. The validator handles this gracefully by routing to the failure-log branch. Mitigations: drop `num_predict` to 150 (still enough for a complete rule object), or move Ollama to GPU.
+- **LLM returns invalid JSON.** Despite `format: "json"`, small local models occasionally produce malformed output. Validator catches it.
+- **LLM invents indicators not in the input.** Validator doesn't catch this — the rule still imports. The `enabled: false` guardrail and the analyst-in-the-loop review are the safety net. Hardening idea: post-validate that the LLM's `query` string contains at least one of the input IPs/URLs/hashes verbatim.
+- **MISP first-run backfill.** Without the publish_timestamp seed in `cron-publish-to-wf4.sh`, the bridge would post 1,606 historical feed events into WF4 the first time it ran. The bridge seeds state to `now` on first run to avoid this.
+- **Duplicate rule_id.** Mitigated by `Date.now()` in the rule_id template — every generation gets a unique ID.
+
+### 4.5 Workflow 5 — Weekly Maintenance
+
+| Field | Value |
+|---|---|
+| Workflow ID | `ekXEZb2PYaxQt7vv` |
+| Name | `05 Weekly Maintenance (Workflow 5)` |
+| Active | **yes** (last activated 2026-05-10 22:25:09 UTC) |
+| Trigger | Schedule cron `0 4 * * 1` (Mondays 04:00 Africa/Tunis) |
+| Local export | `~/soc-project/n8n/workflows/05-weekly-maintenance.json` |
+| Node count | 8 |
+
+**Plain-English purpose.** Once a week, Monday morning at 04:00 local, this workflow retrains the ML Anomaly model on the last 30 days of Elasticsearch alerts, checks the health of all four core services (ML API, Correlation Engine, Elasticsearch, alert volume over the last 7 days), and posts a single low-severity TheHive case `[WEEKLY-MAINT] YYYY-MM-DD — ML retrained, N alerts last 7d` so the analyst has a paper trail that the system is maintaining itself. No analyst action is needed unless ML training errored, Elasticsearch is red, or the alert count was zero (which would indicate a silent pipeline outage).
+
+**Flow diagram.**
+
+```mermaid
+flowchart TD
+  A[Mondays 04:00 schedule] --> B[ML: /train 30d]
+  B --> C[ML: /health]
+  B --> D[Correlation: /state]
+  B --> E[ES: cluster health]
+  B --> F[ES: alerts count 7d]
+  F --> G[Build maintenance summary]
+  G --> H[TheHive: create maintenance case]
+```
+
+Note: `ML: /train (30d)` has four outgoing connections — all four health-check nodes fire in parallel after training completes. Only the `ES: alerts count (7d)` node feeds the next stage.
+
+**Node-by-node walkthrough.**
+
+1. **`Mondays 04:00`** (`n8n-nodes-base.scheduleTrigger` v1.2). Cron `0 4 * * 1` in `Africa/Tunis`.
+
+2. **`ML: /train (30d)`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `http://127.0.0.1:5000/train` with body `{"days": 30}`. The Flask ML API pulls the last 30 days of `.alerts-security.alerts-default` from Elasticsearch, retrains the Isolation Forest model, persists it to `/opt/ml-api/model.pkl`, and returns `{"status":"ok", "samples": N, "source": "<index>", "trained_at": <epoch>}`. `continueOnFail: true` so a training error still produces a maintenance case. 600 s timeout.
+
+3. **`ML: /health`** (`n8n-nodes-base.httpRequest` v4.2). GETs `http://127.0.0.1:5000/health` to confirm the model loaded post-retrain. Returns `{"status":"ok", "model_loaded": true}`.
+
+4. **`Correlation: /state`** (`n8n-nodes-base.httpRequest` v4.2). GETs `http://127.0.0.1:5002/state`. Used to count open vs closed buckets in the summary.
+
+5. **`ES: cluster health`** (`n8n-nodes-base.httpRequest` v4.2). GETs `https://192.168.1.50:9200/_cluster/health` with `httpBasicAuth` and `allowUnauthorizedCerts: true`. Returns standard cluster health JSON; we read `status` (`green`/`yellow`/`red`) and `active_shards_percent_as_number`.
+
+6. **`ES: alerts count (7d)`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to `https://192.168.1.50:9200/.alerts-security.alerts-default/_count` with body `{"query":{"range":{"@timestamp":{"gte":"now-7d"}}}}`. Returns `{"count": N}`.
+
+7. **`Build maintenance summary`** (`n8n-nodes-base.code` v2). JavaScript that pulls each upstream node's output into a flat summary object: `{ml_train_status, ml_train_samples, ml_train_source, ml_health, ml_model_loaded, corr_open_buckets, corr_closed_buckets, es_status, es_active_shards_pct, alerts_7d}`. Uses `??` (nullish coalescing) so explicit `false`/`0` survive.
+
+8. **`TheHive: create maintenance case`** (`n8n-nodes-base.httpRequest` v4.2). POSTs to TheHive's case-create with the TheHive Bearer. Title: `[WEEKLY-MAINT] {yyyy-LL-dd} — ML retrained, {alerts_7d} alerts last 7d`. Description has five sections: ML Anomaly retraining, Correlation Engine, Elasticsearch, Alert volume, and a final line "No analyst action required unless ml_train_status is 'error', es_status is 'red', or signals_7d == 0 (suggests pipeline silence)." Severity 1, tags `["PFE","SOC-Lab","weekly-maintenance","automated"]`, flag false.
+
+**How this workflow fits into the SOC pipeline.** WF5 is the system's self-maintenance log. It keeps the anomaly model current (training on a sliding 30-day window so the model's notion of "normal" follows real traffic patterns), produces a weekly health-check audit trail in TheHive, and surfaces silent failures (ES red, zero alerts in 7 days) that the live pipeline alone wouldn't notice.
+
+**Failure modes:**
+
+- **ML training error.** `/train` returns `{"status":"error","error":"..."}`. The Code node reads `ml_train.error` and surfaces it in the case description as `ml_train_status`. The analyst sees the error in the weekly case and investigates.
+- **ES unreachable.** Both ES nodes hit `neverError: true` so they return whatever (typically `{}` or an HTTP error wrapped item). The Code node uses `?? 'unreachable'` defaults so the summary still renders.
+- **Zero alerts in 7 days.** The summary surfaces this as `alerts_7d: 0` and the description's final line explicitly calls it out as a sign of pipeline silence (e.g. detection rules disabled, Fleet broken, agents disconnected).
+- **First Monday with no alerts to train on.** ML API bootstraps from synthetic alerts on its first start (1000 samples, 5% anomalous), then `/train` with `{days: 1}` was probed in Phase 9 testing returning `{ok: true, source: "synthetic:1000", trained_at: 1778078256}`. If `days: 30` runs while still on synthetic data, it returns the synthetic source label so the analyst knows real-data training hasn't happened yet.
+
+---
+
+## 5. The TheHive / Cortex / MISP Stack (VM_B1)
+
+This VM is the analyst's workbench. Three services live here in concert: TheHive holds the cases, Cortex enriches the observables on those cases, and MISP feeds the system fresh threat-intelligence IOCs.
+
+### 5.1 TheHive 5.7.1
+
+**Docker image:** `strangebee/thehive:5.7.1` running with `network_mode: host` so the container can reach the native Cassandra and Elasticsearch on `127.0.0.1`.
+
+**What it stores.**
+
+- **Cases** — the unit the analyst works with. Each case has a title, description, severity (1–4), tags, custom fields, an assignee, attached observables, comments, tasks, and a timeline of all events. The 13 cases that constitute Phase 10 evidence (#13, #14, #15, #17, #18, #19) live here in the `SOC-LAB` organisation.
+- **Observables** — IPs, hashes, URLs, domains, files attached to cases. Each observable has a `dataType`, a `data` value, TLP/PAP markers, an IOC flag, and a list of Cortex analyzer reports. WF1's `wf1-14b-add-observable` node and WF2's enrichment dispatch are the two main automated paths that create / use observables.
+- **Alerts** — a lighter-weight pre-case shape. WF4 logs AI-rule-generation events as alerts (not cases) so the analyst can see them grouped under TheHive's Alerts view.
+- **Audit records** — every operation (create, update, comment, observable add) writes to the audit log. The polling bridge `cron-cases-to-wf2.sh` keyed off this until the native notifier started working.
+- **Configuration** — under `/etc/thehive/application.conf` (bind-mounted from `~/soc-project/thehive-cortex/thehive/conf/application.conf` so config survives container recreates).
+
+**Notification configuration (the case-create webhook).**
+
+Endpoint registered at system level via the bind-mounted `application.conf`:
+
+```hocon
+notification.endpoints = [{
+  name = "n8n-soc"
+  type = "webhook"
+  url  = "http://192.168.1.50:5678/webhook/thehive"
+  ...
+}]
+```
+
+Org-level rule persisted on the `SOC-LAB` org config under the org-admin user `socadmin`:
+
+```json
+{
+  "value": {
+    "endpoints": [...],
+    "items": [
+      {"trigger": {"name": "CaseCreated"},
+       "endpoint": "n8n-soc",
+       "filter": {},
+       "enabled": true,
+       "delegate": false}
+    ]
+  }
+}
+```
+
+**Phase 8 vs Phase 10 wiring.** During Phase 8 (2026-05-07) the trigger was `AnyEvent` with `delegate: true` and the notifier actor never dispatched (logs showed `Starting fixed thread pool with 2 threads` and then silence). The team flipped to a polling bridge as workaround (`cron-cases-to-wf2.sh` every minute, posting the case JSON in TheHive's native envelope shape directly to `/webhook/thehive`). On 2026-05-10 the native notifier was found to be firing — exec 284 fired ~3 min after case #18, no bridge involvement. The current configuration uses `CaseCreated` trigger with `delegate: false`. The bridge remains in place as resilient fallback; WF2 is idempotent on duplicate POSTs (each n8n execution is independent and the comment node tolerates repeat calls).
+
+**Users in the SOC-LAB organisation:**
+
+| Login | Profile | Used for |
+|---|---|---|
+| `admin@thehive.local` | admin (built-in) | Bootstrap; default password `secret` changed on first login |
+| `soc-bot@thehive.local` | analyst | n8n WF1 case-create bearer (cred `Ux32rgVuHoXKc1GY`) |
+| `socadmin@thehive.local` | org-admin | Manages SOC-LAB org configuration (notifier rules etc.) |
+
+**License situation.** TheHive 5 ships with an auto-loaded **15-day Platinum trial**. On VM_B1 it was activated when Phase 4 started (2026-04-29). The trial expires **2026-05-14** (~48 hours from this handbook). On Community license, the platform stays usable but several Platinum-only features degrade:
+
+- The 2-user license cap kicks in (Community allows 2 active users plus the built-in admin) — `soc-bot` and `socadmin` fit within the cap, but `admin@thehive.local` may need to be deactivated or the org consolidated.
+- Multi-organisation features are restricted on Community; SOC-LAB org should remain functional but cross-org sharing UI may disappear.
+- Some custom-field types and built-in dashboards may downgrade.
+
+The user has flagged this in CLAUDE.md `pending` list as "TheHive Platinum trial expires 2026-05-14 — assess Community fallback impact". Pre-trial-expiry action item: export all 13 cases as JSON via the TheHive API for the rapport before any feature degrades.
+
+### 5.2 Cortex 4.0.1 — the 4 analyzers
+
+**Docker image:** custom-built `soc-cortex:4.0.1-analyzers` (Dockerfile at `~/soc-project/thehive-cortex/cortex/Dockerfile`) extending `thehiveproject/cortex:4.0.1`. Process mode (not docker-in-docker — that path was rejected because it required `chown 1001:1001 /var/run/docker.sock` which locks `vboxuser` out of the host docker). The image bakes in:
+
+- `cortexutils` (analyzer SDK)
+- `pymisp` (for the MISP analyzer)
+- `OTXv2` (for OTXQuery)
+- `vt-py` (for VirusTotal)
+- `python-magic`, `libmagic1` (file type detection)
+- The full `Cortex-Analyzers/` tree (shallow-cloned from GitHub at build time, ~191 MB)
+
+**Organization:** `SOC-LAB` (created in Phase 4 by the user via the Cortex setup wizard).
+
+**User accounts:**
+
+- **superadmin** — created via Cortex setup wizard, API key saved as `CORTEX_SUPERADMIN_API_KEY` in `~/soc-project/.env.local`.
+- **cortex-user** — has roles `read, analyze, orgadmin` (the orgadmin role added so the same key can both configure analyzer instances and run them, saving the need for a second key). API key `6MWnt7E3FdH0muqjoG6Xyd+5msDQf4S2` is reused as both `CORTEX_USER_API_KEY` in `.env.local` and the bearer for n8n's `HK1qH743oIbnpSbk` credential.
+
+**CSRF gotcha:** Cortex 4.0.1 uses a custom header `X-CORTEX-XSRF-TOKEN` for session-auth writes (the cookie is `CORTEX-XSRF-TOKEN`). Bearer-token auth bypasses CSRF. n8n uses bearer auth so this isn't an issue for the workflows, but it bit early scripting attempts.
+
+**The 4 registered analyzer instances** (verified 2026-05-10 in SOC-LAB org via the `cortex-user` orgadmin key, `GET /api/analyzer`):
+
+| Analyzer | Instance UUID | Definition ID | Verified output |
+|---|---|---|---|
+| **AbuseIPDB** | `6b1c7570c74b55db697a69aa2c719b4f` | `AbuseIPDB_2_0` | 8.8.8.8 → Whitelisted/CDN/score 0 in <5 s. 185.220.101.1 → 100/malicious, Tor=True |
+| **VirusTotal_GetReport** | `8cac1902c2e7879f2d258a3bfc7ba1f5` | `VirusTotal_GetReport_3_1` | 8.8.8.8 → 0/92 with 200 resolutions. WannaCry SHA256 → 69/75 malicious |
+| **OTXQuery** (patched) | `eb540d51238c71257ca2713bafd84d2e` | `OTXQuery_2_0` | 198.51.100.1 → 4 pulses 0 malicious. 185.220.101.1 → 50 pulses 1 malicious (known Tor exit). 3/3 PASS in ~30 s each |
+| **MISP** | `b20c109bfc76cda9b8690ebf77f77931` | `MISP_2_2` | Wired to `https://192.168.1.51:8443`, `cert_check: false`, tested OK |
+
+**API keys for the external analyzers** are stored in `~/soc-project/.env.local` on VM_B1 as `ABUSEIPDB_API_KEY`, `VIRUSTOTAL_API_KEY`, `OTX_API_KEY` (all free-tier). The MISP analyzer uses the same MISP admin API key as the rest of the MISP integration.
+
+**Use the INSTANCE UUID, not the definition id, in workflow paths.** WF2 was calling `AbuseIPDB_1_0` (definition id with wrong version suffix `_1_0` vs the installed `_2_0`) and Cortex returned 404. The fix is to call `/api/analyzer/{instance_uuid}/run` directly. The current WF2 snapshot uses the four instance UUIDs above.
+
+**Latency budget:** AbuseIPDB ~1-3 s, VirusTotal_GetReport ~3-5 s, OTXQuery ~25-35 s (still slow due to 4 sequential section calls; could be parallelized but acceptable as enrichment SLA).
+
+### 5.3 MISP 2.5
+
+**Deployment:** Docker stack at `https://192.168.1.51:8443`. 5 containers — `misp-core`, `misp-modules`, `db` (MariaDB 10.11), `redis` (Valkey 7.2), `mail`. First boot needed `docker compose up -d` run twice because the modules health check window is shorter than its actual readiness (this is a known MISP-Docker quirk).
+
+**Port binding:** Bound to `192.168.1.51:8080` / `192.168.1.51:8443` only (not `0.0.0.0`) because ufw INPUT rules can't filter Docker-published ports. Compose env vars in `~/soc-project/misp/.env`: `CORE_HTTP_PORT=192.168.1.51:8080`, `CORE_HTTPS_PORT=192.168.1.51:8443`.
+
+**What it's used for in the pipeline:**
+
+1. **IOC source for WF4.** Every published MISP event is the input to WF4's AI rule generation. The bridge `cron-publish-to-wf4.sh` (every 1 min) queries `/events/restSearch` with `publish_timestamp` filter and POSTs each newly-published event JSON to `http://192.168.1.50:5678/webhook/misp`. First-run seeds state to `now` to avoid backfilling 1,606 historical feed events.
+2. **Threat intel for Cortex enrichment.** The MISP analyzer in Cortex (instance UUID `b20c109bfc76cda9b8690ebf77f77931`) lets observables be queried against MISP attributes for cross-reference. Not currently wired into WF2's analyzer dispatch, but the analyzer is registered and tested.
+
+**Feeds enabled** (all 96 bundled defaults loaded via `/feeds/loadDefaultFeeds`, four enabled with caching+fetch):
+
+| Feed ID | Name | Type |
+|---|---|---|
+| 1 | CIRCL OSINT Feed | MISP feed |
+| 4 | ET Compromised IPs (rules.emergingthreats.net) | MISP feed |
+| 12 | Feodo IP Blocklist | MISP feed |
+| 65 | Abuse.ch URLhaus | MISP feed |
+
+**Feed refresh:** host cron on VM_B1, `0 */6 * * * /home/vboxuser/soc-project/misp/cron-feeds.sh` — every 6 hours docker-execs `cake Server fetchFeed/cacheFeed all` and rotates its own log. Host cron (not in-DB MISP scheduler) because the `misp-core` image doesn't run the `scheduler` background worker (only default/email/cache/prio/update).
+
+**Admin credentials:** `admin@admin.test / admin` is the default — changed on first login. API key stored in `~/soc-project/.env.local` as `MISP_API_KEY`.
+
+**Self-signed cert:** Cortex's MISP analyzer config needs `cert_check: false` for the lab. Likewise the bridge curls with `-k`.
+
+**MISP has no native single-URL outbound webhook** — only ZeroMQ and email. The polling bridge is simpler and survives container restarts cleanly.
+
+### 5.4 The OTXQuery patch
+
+**Problem (pre-fix):** OTXQuery was hanging forever on TheHive Cortex jobs. Root cause:
+
+1. Upstream `otxquery.py` had no HTTP timeout on its four `requests.get` calls.
+2. The `passive_dns` and `url_list` sections return massive payloads for popular IPs — millions of records for 8.8.8.8 — that never finish.
+3. The analyzer's blanket `except Exception` then masked the real error, so analysts saw "job stuck running" rather than "this IP returned too much data".
+
+**Fix applied 2026-05-10 to `/home/vboxuser/soc-project/thehive-cortex/cortex/Cortex-Analyzers/analyzers/OTXQuery/otxquery.py`:**
+
+- Added `timeout=15` on every `requests.get` call (all four callsites).
+- `otx_query_ip` function: dropped the `passive_dns` and `url_list` sections entirely; kept `general`, `reputation`, `geo`, `malware`.
+- Wrapped each remaining section in its own `try/except` so a single section failure no longer kills the whole job.
+- Added a `partial_errors[]` list reported when any section fails — so the analyst sees explicitly which section couldn't be fetched.
+
+**Rebuild and verification:** The `soc-cortex:4.0.1-analyzers` image was rebuilt; the cortex container was recreated (no host downtime — TheHive auto-reconnected). Verified via `POST /api/analyzer/{instance_uuid}/run`:
+
+- 198.51.100.1 → 4 pulses, 0 malicious, returned in ~30 s.
+- 185.220.101.1 → 50 pulses, 1 malicious, identified as a known Tor exit node, returned in ~30 s.
+- Final smoke test 3/3 PASS in ~30 s each.
+
+**Caveat for redeployment:** the patch lives in `~/soc-project/` on VM_B1, which is NOT in the `soc-shared` Git repo (the `Cortex-Analyzers/` tree is a vendored upstream clone). If VM_A1 ever runs its own Cortex install, the patch must be re-applied there. VM_B1's Cortex is the canonical one for SOC-LAB so this isn't blocking.
+
+### 5.5 License situation
+
+TheHive 5.7.1 was deployed with the **auto-loaded 15-day Platinum trial**, activated 2026-04-29. The trial **expires 2026-05-14** (about 48 hours after this handbook's generation date).
+
+**What degrades on Community license:**
+
+- **2-user license cap.** Community allows the built-in `admin@thehive.local` plus 2 active org users. The current 3-user setup (admin + soc-bot + socadmin) exceeds the cap and will force consolidation. Probable consolidation: deactivate or downgrade `admin@thehive.local` (it's only needed for first-time setup) and keep `soc-bot` (analyst, used by n8n) + `socadmin` (org-admin).
+- **Multi-organisation features.** Some org-management UI may disappear. SOC-LAB org should remain functional but cross-org case sharing may not be available.
+- **Custom fields.** Some custom-field types (e.g. `date`, `boolean`) are Platinum-only; the cases currently use only `string` and numeric severity, so this shouldn't bite.
+- **Advanced analytics dashboards.** Built-in Platinum dashboards downgrade to a basic set on Community.
+- **API rate limiting.** Community may apply tighter API rate limits, which could slow down WF2 enrichment dispatch if many observables flow at once.
+
+**Pre-expiry action (recommended before 2026-05-14):**
+
+- Export all 13 Phase 10 cases as JSON via `GET /api/v1/case/{id}` for the rapport evidence trail.
+- Export the SOC-LAB org config so it can be re-applied if any field is lost.
+- Decide which 2 users to keep active; document the choice for the rapport.
+
+---
+
+## 6. The Detection Stack (VM_A1)
+
+This VM is the brain — every detection, every score, every workflow, every LLM call originates here.
+
+### 6.1 Elasticsearch 8.19.14
+
+Single-node mode, security enabled, self-signed TLS cert at `https://192.168.1.50:9200`. Cluster name `soc-core`, node name `soc-core`, heap dropped from the original 4 GB to **2 GB** on 2026-05-05 to make room for Ollama (backup config at `heap.options.bak-20260505`).
+
+**Status:** yellow (single-node, primaries active, replicas unassigned as expected for a single-node cluster — 72 primaries active, 29 unassigned replicas after the heap trim).
+
+**CA fingerprint:** `3c05387e1bd8f68441f718f08611bcc7d7d22d02e3be8901beeced45976965d4`.
+
+**Key indices:**
+
+- `.alerts-security.alerts-default` — every Kibana detection rule alert lands here. WF1 reads it; WF5 counts it.
+- `.kibana-event-log-*` — detection-engine execution history. (Was source of SOC-011's self-triggering false positives before bug #6 added `not host.name:"soc-core"`.)
+- `logs-*` — host log indices written by Elastic Agent: `logs-system-*`, `logs-apache.access-*`, `logs-suricata.eve-*`, `logs-vsftpd-*`.
+- `filebeat-*` — referenced by WF4's generated rule index list.
+- `metrics-*` — host metrics from the system integration.
+
+### 6.2 Kibana 8.19.14
+
+UI at `http://192.168.1.50:5601` (plain HTTP, lab — no TLS). Login as `elastic` user, password in `~/soc-project/.env.local` as `ELASTIC_PASSWORD`. Encryption keys set in `/etc/kibana/kibana.yml` (`xpack.encryptedSavedObjects/reporting/security.encryptionKey`) — required before any action connector can be created.
+
+**Detection rules:**
+
+- **1,644 prebuilt Elastic SIEM rules** installed and disabled by default. Enable selectively. All carry native MITRE `threat[]` tagging.
+- **13 custom SOC rules** SOC-001 through SOC-013 imported from `~/soc-project/kibana/soc-rules.ndjson`, all enabled.
+
+Each custom rule carries:
+
+- Native MITRE `threat[]` with tactic + technique + subtechnique objects with refs
+- Tags including `mitre:TA0XXX`, `mitre:T1XXX`, `auto_block` (where applicable), Elastic-convention `Domain: ...`, `OS: Linux`, `Tactic: ...`
+- `meta: {auto_block, soc_layer, soc_id}`
+- `actions[]` referencing the `n8n-soar-webhook` connector with mustache body:
+  ```
+  {"rule_id":"{{rule.params.ruleId}}","rule_name":"{{rule.name}}",
+   "severity":"{{rule.params.severity}}","risk_score":{{rule.params.riskScore}},
+   "auto_block":true,"results_link":"{{{context.results_link}}}"}
+  ```
+
+Note `rule.params.ruleId` not `rule.rule_id` — Phase 10 bug #2 root-cause. Three-mustache `{{{...}}}` for `results_link` to avoid HTML-escaping the URL.
+
+**Action connector:** id `7c351a6c-4de6-4c07-8146-fa337033c735`, name `n8n-soar-webhook`, type `.webhook`, target `http://192.168.1.50:5678/webhook/elastic-alert`, `hasAuth: false`. The `.webhook` connector type is gated to Gold+ on Basic license — a 30-day trial was started on 2026-05-06 (expires ~2026-06-05) to unlock it. Fallback if the trial expires: switch detection rules to a "noop" action and have n8n's Elasticsearch node poll `.alerts-security.alerts-default` directly (works on Basic forever; adds polling latency).
+
+### 6.3 Logstash 8.19.14
+
+Pipeline `/etc/logstash/conf.d/soc-pipeline.conf`:
+- Inputs: `beats` on 5044, `syslog` on 5140
+- Output: ES `https://192.168.1.50:9200` (`ssl_verification_mode: none` for lab self-signed)
+- `ELASTIC_PASSWORD` passed via systemd drop-in `/etc/systemd/system/logstash.service.d/override.conf` (mode 600). Logstash-keystore was tried first; the JRuby `create` step hung indefinitely on this slow VM so systemd Environment was used instead.
+
+Smaller role here because Elastic Agent does most log shipping directly. Kept for future syslog integration with network devices.
+
+### 6.4 Fleet Server + Elastic Agent (Fleet Server mode)
+
+Agent installed via tarball in Fleet Server mode (the .deb path doesn't expose `--fleet-server` flags). Self-enrolled into agent policy `fleet-server-policy` (created via Fleet API with `has_fleet_server=true`, which auto-added the `fleet_server@1.6.0` package). Listens on `:8220` with `--insecure` (self-signed cert).
+
+**Service token** for Fleet Server is in `~/soc-project/.env.local` as `FLEET_SERVER_SERVICE_TOKEN`.
+
+**Agent enrollment workflow** (for adding more hosts):
+
+```bash
+# On VM_A1, mint a fresh per-policy enrollment key
+curl -s -u elastic:$ELASTIC_PASSWORD -H "kbn-xsrf: soc" \
+  -H "Content-Type: application/json" \
+  -X POST "http://localhost:5601/api/fleet/enrollment_api_keys" \
+  -d '{"policy_id":"c226ca2c-fcd2-40c8-9ca6-11392fc7e24e",
+       "name":"victim-lab-key-'"$(date +%s)"'"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['item']['api_key'])"
+```
+
+```bash
+# On the target host
+sudo ./elastic-agent install \
+  --url=https://192.168.1.50:8220 \
+  --enrollment-token=<token> \
+  --insecure --non-interactive
+```
+
+**Enrolled agents:** 2 — VM_A1's own Fleet-Server agent, and VM_B2's agent (id `c328f63a-4d33-437b-9cc1-cdfbb060df45`, HEALTHY since enrollment 2026-04-29, in `victim-lab policy` id `c226ca2c-fcd2-40c8-9ca6-11392fc7e24e`).
+
+### 6.5 Suricata IDS (lives on VM_B2, feeds A1 via Filebeat/Agent)
+
+Suricata 8.0.3 on VM_B2 listens on the ZeroTier interface `ztdiyzommr`. 49,911 ET Open rules loaded (of 65,786 total; 15k disabled by default). HOME_NET covers `192.168.0.0/16`. 6 worker threads. Output: `/var/log/suricata/eve.json`. `suricata-update` daily cron `0 3 * * *` refreshes the ruleset and reloads Suricata.
+
+The Elastic Agent on VM_B2 has the native Suricata integration attached (`suricata-victim-lab` integration in the agent policy) which reads `eve.json`, parses it to ECS, and ships to VM_A1's Elasticsearch index `logs-suricata.eve-*`. From there it's queryable in Kibana SIEM and any prebuilt or custom rule targeting Suricata events will match.
+
+### 6.6 Ollama + llama3.1:8b
+
+Ollama 0.22.1 on VM_A1 port 11434 (localhost-only). Model `llama3.1:8b` (4.9 GB, sha256 `667b0c1932bc`) pulled cleanly in Phase 3 at ~5.4 MB/s. Systemd drop-in `/etc/systemd/system/ollama.service.d/override.conf` sets `OLLAMA_KEEP_ALIVE=24h` so the model stays warm in RAM across calls (cold load is ~5 min on this disk due to mmap=false, ~17 MB/s tensor read).
+
+**Performance:** warm-path generation runs at ~0.3 tok/s CPU-only. WF1's `Ollama: summarize` uses `num_predict: 30` so a typical summary takes ~100 s warm. WF4's `Ollama: generate rule (JSON)` uses `num_predict: 400` so a typical rule generation takes ~22 min — exceeds the 10-min timeout. Either drop to 150 or move to GPU.
+
+A `gemma3:4b` was pulled in Phase 10 as a swap candidate; benchmarked ~0.47 tok/s warm vs llama's ~0.3 — not the 3× win expected. Decision: stick with `llama3.1:8b` + `num_predict=30`. `gemma3:4b` stays on disk for future experimentation.
+
+**Used by:**
+
+- **WF1** `Ollama: summarize` — 2-sentence SOC analyst summary per new case
+- **WF3** `Ollama: digest summary` — 3-sentence daily digest
+- **WF4** `Ollama: generate rule (JSON)` — JSON-output mode rule generation
+
+### 6.7 The two Flask APIs
+
+These are the original microservices kept after the Phase 3 re-architecture (the other two — NLP API and MITRE Tagger — were dropped because n8n + Ollama and Kibana's built-in MITRE tagging cover the same job).
+
+**ML Anomaly Detection API — `127.0.0.1:5000`**
+
+```
+POST /score
+  Input:  { "rule_id": str, "source_ip": str, "severity": str, "risk_score": int,
+            "mitre_tactic_id": str, "mitre_technique_id": str }
+  Output: { "anomaly_score": float, "is_anomaly": bool, "model": "IsolationForest" }
+
+POST /train
+  Input:  { "days": int }
+  Output: { "status": "ok", "samples": N, "source": "...", "trained_at": <epoch> }
+
+GET /health
+  Output: { "status": "ok", "model_loaded": bool }
+```
+
+Backend: scikit-learn IsolationForest. Bootstraps from a synthetic alert distribution on first start (n=1000, 5% anomalous) — `/health` reports `"source":"synthetic:1000"` until the first real `/train` succeeds. Retrains via `POST /train` on the last 30 days of `.alerts-security.alerts-default`. Model persisted at `/opt/ml-api/model.pkl`. Runs under gunicorn (1 worker, 127.0.0.1 only) as a systemd service. `/opt/ml-api/` symlinks back to `~/soc-project/ml-api/`. `EnvironmentFile` points at `~/soc-project/.env.local` for `ELASTIC_PASSWORD`.
+
+Used by WF1's `ML: /score` and WF5's `ML: /train (30d)` + `ML: /health`.
+
+**Correlation Engine — `127.0.0.1:5002`**
+
+```
+POST /correlate
+  Input:  { "source_ip": str, "rule_id": str, "mitre_tactic_id": str,
+            "mitre_technique_id": str, "severity": str, "anomaly_score": float,
+            "auto_block": bool }
+  Output: { "action": "create_new"|"add_to_existing"|"escalate_existing"|"suppress"|"queue",
+            "bucket_id": int, "case_id": str, "chain_detected": {...} }
+
+POST /correlate/set_case
+  Input:  { "bucket_id": int, "case_id": str }
+
+GET /state
+  Output: { "buckets": [{ bucket_id, rule_id, source_ip, alert_count,
+                          max_severity, closed, case_id, ... }] }
+
+POST /whitelist/add
+POST /close
+  Input: { "bucket_id": int }
+```
+
+State: SQLite DB at `/opt/correlation-engine/state.db`. **30-minute same-`(source_ip, rule_id)` bucket window** for storm dedup; **2-hour cross-tactic kill-chain window** that escalates a case the moment a second MITRE tactic appears from the same source IP. Whitelist for known-good IPs. Daily-digest queue for low-severity, low-anomaly alerts.
+
+All 6 actions verified end-to-end in Phase 3 testing:
+- `create_new` — fresh bucket, no existing match
+- `add_to_existing` — same `(ip, rule)` within 30 min, case already created
+- `escalate_existing` — kill-chain detected (new tactic from same source within 2 h)
+- kill-chain escalate (same as above, internal state transition)
+- `queue` — low signal, accumulate for digest
+- `suppress` — whitelisted source
+
+Runs under gunicorn (1 worker, 127.0.0.1 only) as a systemd service. `/opt/correlation-engine/` symlinks back to `~/soc-project/correlation-engine/`.
+
+Used by WF1's `Correlation Engine: /correlate` + `set_case`, WF3's `/state` + `/close`, and WF5's `Correlation: /state`.
+
+**This is the biggest original contribution of the project** — kill-chain detection across MITRE tactics is not built into Kibana alert suppression or TheHive 5 case grouping. The defendable claim for the rapport is that it solves the "1 attack = 7 cases" problem and the alert-fatigue problem in one component.
+
+### 6.8 The two dropped APIs (for context, since the original plan called for four)
+
+Both dropped 2026-05-05 during Phase 3 re-architecture:
+
+- **NLP Summarization API (port 5001)** — would have been a Flask wrapper around Ollama. Replaced by direct n8n `httpRequest` calls to Ollama with `format:"json"`. Prompt templates live in the n8n workflow JSON. No Flask shim buys anything.
+- **MITRE Auto-Tagger (port 5003)** — would have been a TF-IDF + LLM-disambiguation tagger. Replaced by:
+  - Kibana's detection-engine UI/API takes MITRE tags natively via `threat[]` at rule definition time
+  - Elastic prebuilt rules ship pre-tagged
+  - Sigma carries `attack.t####` tags through `sigma2elastic`
+  - Community classtype-to-MITRE JSONs cover Suricata's gaps
+
+Both decisions are defendable in the rapport: "don't reinvent built-ins". The two services' directories (`~/soc-project/nlp-api/`, `~/soc-project/mitre-tagger/`) still exist as empty leftovers from before the drop; harmless.
+
+---
+
+## 7. The Victim and Attacker (VM_B2, VM_A2)
+
+### 7.1 VM_B2 — what runs as the vulnerable target
+
+DVWA at `http://192.168.1.53/dvwa` is the primary web target. Security level set to `low` (cookie `security=low` is the default after Phase 5's `default_security_level` flip). DVWA exposes:
+
+- **SQL injection** at `/vulnerabilities/sqli/` (the canonical DVWA endpoint exercised in Phase 10's case #19 lead-up)
+- **XSS reflected & stored** at `/vulnerabilities/xss_r/` and `/xss_s/`
+- **CSRF, RFI** (with `allow_url_include=On`)
+- **Command injection** at `/vulnerabilities/exec/` (exercised in Phase 10 — case #19 SOC-006)
+- **File upload, brute-force login**
+
+DVWA database: `dvwa` DB, `dvwa@localhost` user with random 24-char password (saved as `DVWA_DB_PASSWORD` in `~/soc-project/.env.local`). MariaDB root uses unix_socket auth.
+
+Beside DVWA:
+
+- **vsftpd** on port 21 with anonymous disabled, local users enabled (`testuser1/2`, `webadmin`). Brute-force target.
+- **OpenSSH** on port 22 with password auth enabled, three weak local users created without sudo:
+  - `testuser1 / password123`
+  - `testuser2 / admin`
+  - `webadmin / webadmin`
+  All three confirmed loginable via SSH and FTP.
+- **Suricata** sniffing all traffic on the ZeroTier interface for the network-IDS layer.
+
+### 7.2 VM_A2 — what attacks have been simulated
+
+Although VM_A2 is descoped, attacks have been launched from `192.168.1.52` (the user's manually started Kali install) and the user's host `192.168.1.60`:
+
+- **SOC-001 SSH brute force** (case #13, prior session). Triggered using hydra-style or expect-driven password retries — required the `PerSourcePenalties no` fix on 2026-05-08 for the KQL to match.
+- **SOC-005 XSS reflected attempt** (cases #14, #17). URL-encoded `%3Cscript%3E` payload variants. URL-encoded only (bare `<script>` is invalid KQL — bug #2 fix).
+- **SOC-006 OS command injection** (case #19, 2026-05-10) — the auto-block end-to-end verification. Triggered from `192.168.1.52` (kali). Pipeline: apache.access logs ingest → SOC-006 rule fires → WF1 create_new path → ML score + Ollama summary + TheHive case #19 + observable creation → SSH from A1 → B2 `iptables -I INPUT -s 192.168.1.52 -j DROP` (rc=0) → TheHive auto-block comment. Verified VM_A2 lost VM_B2 access immediately (curl timed out, http=000), VM_A1 retained access through the `soc-response` key (selective source-IP blocking confirmed).
+- **SOC-011 reverse-shell command pattern** (case #15, prior session). Required bug #5 fix (multi-NIC IP array IIFE) — case title verified "from 10.0.2.15" (a B2 NAT IP, picked correctly by the IIFE). Also required bug #6 (`not host.name:"soc-core"`) to stop the rule self-triggering on Kibana event-log indices.
+- **SOC-012 SSH login from non-management host** (case #18, this session). Triggered by ssh-ing FROM `.52` TO `.53`. Used expect on A2 to chain through password auth. Escalated by SOC-006 absorption into the same correlation bucket.
+- **SOC-004 SQL injection critical-payload** (case #11, prior session). Was the first full-green end-to-end run on 2026-05-07. Six fresh SQLi requests (lambda..pi series). SOC-003/004 rules fired; WF1 exec 22 ran all 14 nodes successfully → TheHive case #11 in SOC-LAB org → bridge fired WF2 exec 24 ~3 min later (60 s polling cadence) → Cortex enrichment dispatched. Auto-block: VM_B2 became unreachable from VM_A1 immediately after WF1 finished (iptables rule blocking `-s 192.168.1.50`); subsequently cleared by `iptables -D` on B2.
+
+**Latency observations from Phase 10:**
+
+- Fast WF1 path (no NLP — `add_to_existing`/`queue`): 0.4–2.8 s
+- Slow WF1 path (Ollama summarize on `create_new`): 60–632 s
+- Worst case: SOC-005 first this session = 614 s (Ollama cold)
+- Subsequent SOC-006 (Ollama warm) = 135 s
+- SOC-006 second batch: 36 alerts collapsed to 1 case (Kibana action summary mode + correlation 30-min bucket)
+
+### 7.3 The end-to-end attack → detection → case path (high level)
+
+The summary, before the per-scenario walkthroughs in Section 8:
+
+1. Attacker (kali / .60 / .52) sends a malicious packet or HTTP request to victim-lab (.53).
+2. Suricata on B2 inspects the packet → writes to `/var/log/suricata/eve.json`. Apache on B2 logs the request → `/var/log/apache2/access_soc.log`. System logs may write auth events → `/var/log/auth.log`.
+3. Elastic Agent on B2 (`c328f63a-4d33-437b-9cc1-cdfbb060df45`) ships all three to Fleet Server (A1:8220) → Elasticsearch (A1:9200) indices `logs-suricata.eve-*`, `logs-apache.access-*`, `logs-system.auth-*`.
+4. Kibana detection rules (custom SOC-XXX + prebuilt) match the events on a 5-minute polling interval. Each match → `.alerts-security.alerts-default` index → action fires.
+5. The `.webhook` action POSTs `{rule_id, rule_name, severity, risk_score, auto_block, results_link}` to `http://192.168.1.50:5678/webhook/elastic-alert` (n8n WF1).
+6. WF1 runs its 20 nodes. For new cases: TheHive case created in SOC-LAB org with title `[SOC-XXX] {rule_name} from {ip}`, AI summary in description, MITRE tags, severity 1-4, observable attached.
+7. TheHive's `CaseCreated` notifier fires `n8n-soc` webhook → WF2 receives → dispatches AbuseIPDB / VirusTotal jobs to Cortex via instance UUIDs.
+8. Cortex jobs run; reports link themselves into TheHive observable view.
+9. If `auto_block: true`, WF1's SSH node lands `iptables -I INPUT -s {attacker} -j DROP` on B2 within seconds of case creation.
+10. Analyst sees one enriched case in TheHive with full timeline, AI description, MITRE tags, ML score, Cortex enrichment, and response-status comment.
+
+---
+
+## 8. End-to-End Pipeline Scenarios
+
+This section walks through complete end-to-end scenarios — both success paths and failure modes. Each scenario tells you what triggers, what data flows where, what the analyst sees, and (for failure scenarios) which step fails and why.
+
+### Scenario A — SUCCESS: A new attack triggers a Suricata rule
+
+**Trigger.** Attacker on `192.168.1.52` runs an `nmap` scan or sends a payload that matches one of Suricata's 49,911 ET Open rules. Concretely, a request to `http://192.168.1.53/dvwa/vulnerabilities/sqli/?id=1' OR '1'='1` that trips an ET WEB_SPECIFIC_APPS rule.
+
+**Path.**
+
+1. **B2 / Suricata** — packet inspected on `ztdiyzommr`, classified by an ET rule, written to `/var/log/suricata/eve.json` as a JSON line with `event_type: alert`, `alert.signature`, `src_ip`, `dest_ip`, etc.
+2. **B2 / Elastic Agent (`suricata-victim-lab` integration)** — reads the new eve line, parses to ECS, ships to Fleet Server.
+3. **A1 / Fleet Server :8220** — receives the event, hands to local Elasticsearch.
+4. **A1 / Elasticsearch :9200** — indexes the document into `logs-suricata.eve-default-YYYY.MM.DD`.
+5. **A1 / Kibana detection engine** — on its 5-minute schedule, SOC-003 (SQL injection attempt — `TA0001 / T1190`, severity medium, no auto_block) runs its KQL against `logs-suricata.eve-*` and `logs-apache.access-*`. Match → writes a signal to `.alerts-security.alerts-default`.
+6. **A1 / Kibana actions** — the rule's `.webhook` action fires, POSTing the canonical payload to `http://192.168.1.50:5678/webhook/elastic-alert`.
+7. **A1 / n8n WF1** — webhook receives, ES fetch returns the alert hit (containing `source.ip: "192.168.1.52"`), Kibana rule definition returns the `threat[]` with `TA0001 / T1190`. `Build canonical payload` produces `{rule_id: "SOC-003", source_ip: "192.168.1.52", severity: "medium", risk_score: 47, mitre_tactic_id: "TA0001", mitre_technique_id: "T1190", auto_block: false, ...}`.
+8. **A1 / Correlation Engine :5002** — `/correlate` returns `{action: "create_new", bucket_id: 23, case_id: null, chain_detected: null}` (fresh bucket).
+9. **A1 / Switch by action** — routes to `create_new` branch.
+10. **A1 / ML API :5000** — `/score` returns `{anomaly_score: 0.71, is_anomaly: true, model: "IsolationForest"}`.
+11. **A1 / Ollama :11434** — `Ollama: summarize` (warm) returns ~30 tokens of summary text in ~100 s.
+12. **A1 / TheHive create case** — POST to `http://192.168.1.51:9000/api/v1/case`. TheHive returns the new case `_id`, e.g. `~123456`.
+13. **A1 / TheHive: add source_ip observable** — POSTs `{dataType:"ip", data:"192.168.1.52", tlp:2, ioc:true, tags:["soc-auto","source.ip"]}` to `/case/{id}/observable`.
+14. **A1 / Correlation Engine: set_case** — `/correlate/set_case` updates the bucket with the case ID so future SOC-003 alerts from `192.168.1.52` within 30 min land as `add_to_existing`.
+15. **A1 / IF auto_block?** — SOC-003 is not auto-block (severity medium), so the false branch fires → `End: case created (no auto-block)`.
+16. **B1 / TheHive native notifier** — `CaseCreated` trigger fires `n8n-soc` webhook → POSTs case envelope `{operation:"create", objectType:"Case", objectId:"~123456", object:{...full case...}}` to `http://192.168.1.50:5678/webhook/thehive`.
+17. **A1 / n8n WF2** — webhook receives, `IF case-create event` evaluates `body.operation contains "create"` → true.
+18. **A1 / TheHive query API** — POST `/api/v1/query` with `getCase + observables` returns the source_ip observable created in step 13.
+19. **A1 / Loop observables** — splitInBatches emits one item: `{dataType:"ip", data:"192.168.1.52", ...}`.
+20. **A1 / Switch by dataType** — routes `ip` branch → `Cortex: AbuseIPDB`.
+21. **B1 / Cortex :9001** — POST `/api/analyzer/6b1c7570c74b55db697a69aa2c719b4f/run` with the IP. Cortex queues a Python job, returns `job_id`. The job hits AbuseIPDB free-tier API, returns within ~1-3 s.
+22. **B1 / Cortex → TheHive** — job result is written back as an analyzer report against the observable.
+23. **A1 / WF2 log comment** — POSTs `Auto-enrichment dispatched: 1 observables sent to Cortex (AbuseIPDB / VirusTotal). Reports will appear on each observable as Cortex jobs complete.` to the case.
+
+**Data shape at each hop.**
+
+- Suricata eve.json line: `{timestamp, event_type:"alert", src_ip, dest_ip, alert:{signature, category, severity}, ...}`
+- Elasticsearch doc after Agent parsing: ECS-shaped with `source.ip`, `destination.ip`, `event.kind:"alert"`, `suricata.eve.alert.signature`, etc.
+- Webhook payload: `{rule_id:"SOC-003", rule_name:"SQL injection attempt", severity:"medium", risk_score:47, auto_block:false, results_link:"https://..."}`
+- Canonical payload: above plus `source_ip`, `mitre_tactic_id`, `mitre_technique_id`, `alert_count`, `first_signal_id`
+- TheHive case body: title, AI summary description, severity 2, tags `["PFE","SOC-Lab","SOC-003","mitre:TA0001","mitre:T1190"]`
+- TheHive case envelope to WF2: `{operation:"create", objectType:"Case", objectId, object}`
+- Cortex AbuseIPDB report: `{abuseConfidenceScore, countryCode, isTor, totalReports, lastReportedAt, ...}`
+
+**End state.** Analyst opens TheHive SOC-LAB, sees a new case titled `[SOC-003] SQL injection attempt from 192.168.1.52`, severity 2 (medium), with:
+- AI summary in description ("A SQL injection attempt was detected from 192.168.1.52 targeting the DVWA web application. Severity medium; recommend reviewing access logs and rate-limiting source.")
+- Observables tab showing one IP observable `192.168.1.52` with AbuseIPDB report (e.g. score 0 if benign source, country code, etc.)
+- Comments: `Auto-enrichment dispatched: 1 observables sent to Cortex (AbuseIPDB / VirusTotal)`
+- Tags including the MITRE codes
+- Timeline showing creation timestamp
+
+### Scenario B — SUCCESS: A MISP feed produces a new IoC and AI generates a Suricata rule
+
+**Trigger.** CIRCL OSINT feed (or Abuse.ch URLhaus / Feodo / ET Compromised IPs) publishes a new MISP event with attributes (IPs, URLs, hashes). MISP's 6-hourly cron fetches it.
+
+**Path.**
+
+1. **B1 / MISP cron** — `/home/vboxuser/soc-project/misp/cron-feeds.sh` docker-execs `cake Server fetchFeed/cacheFeed all` every 6 h. The feed is fetched into MISP's DB as a new Event.
+2. **B1 / MISP** — event is published (admin user publishes; on auto-feeds the event may be auto-published depending on feed config).
+3. **B1 / WF4 bridge** — `cron-publish-to-wf4.sh` (every 1 min) queries `/events/restSearch` with `publish_timestamp > <last>`, finds the new event, POSTs its full JSON to `http://192.168.1.50:5678/webhook/misp`.
+4. **A1 / n8n WF4** — webhook receives.
+5. **A1 / Extract indicators** — JS pulls up to 30 attrs, filters into `ips`, `urls`, `hashes` lists (each capped at 10), reads `info` and `tags`.
+6. **A1 / Ollama :11434** — `Ollama: generate rule (JSON)` POSTs with `format: "json"`, `num_predict: 400`. With CPU-only Ollama this takes ~22 min and may exceed the 10-min timeout (CLAUDE.md known caveat). On GPU it finishes in ~30 s.
+7. **A1 / Validate + assemble NDJSON** — parses Ollama's JSON output, validates `query` is present, assembles full Kibana rule object with `enabled: false`, generates `rule_id: "MISP-AI-{event_id}-{Date.now()}"`.
+8. **A1 / IF Ollama output valid** — true branch.
+9. **A1 / Kibana :5601** — POST `/api/detection_engine/rules/_import?overwrite=true` with the NDJSON as multipart form-data. Kibana imports the rule disabled.
+10. **A1 / TheHive :9000 alert API** — POST `/api/v1/alert` with `type:"misp-ai-rule"`, sourceRef=rule_id, severity 2, full NDJSON in description.
+11. **B1 / TheHive** — new alert appears in SOC-LAB Alerts tab. Analyst sees `[MISP-AI] New detection rule deployed: MISP-AI-{event_id}-{ts}`.
+
+**Data shape.**
+
+- MISP Event JSON: `{Event:{id, info, Attribute:[{type,value},...], Tag:[{name}], ...}}`
+- Extracted indicators: `{event_id, info, tags, ips:[...], urls:[...], hashes:[...], ip_count, url_count, hash_count}`
+- Ollama response: `{response: "{\"name\":\"...\",\"description\":\"...\",\"severity\":\"medium\",\"risk_score\":50,\"query\":\"source.ip:(... OR ...) OR url.original:(...)\",\"tactic_id\":\"TA0011\",\"technique_id\":\"T1071\",\"tags\":[\"c2\",\"feodo\"]}"}`
+- Kibana rule NDJSON: full detection rule with `enabled:false, threat:[{framework:"MITRE ATT&CK", tactic:{...}, technique:[{...}]}], meta:{auto_block:false, soc_layer:"misp-ai", soc_id, source_event}`
+- TheHive alert body: `{type:"misp-ai-rule", source:"n8n-WF4", sourceRef:"MISP-AI-...", title, description: full NDJSON, severity:2, tlp:2}`
+
+**End state.** Analyst opens TheHive SOC-LAB → Alerts tab, sees the new AI-rule alert, expands the description to inspect the generated NDJSON. Goes to Kibana → Security → Rules, finds the new `[AUTO] {name}` rule disabled. Reviews the KQL query for hallucinations; if sensible, enables it; if too broad, drops it.
+
+### Scenario C — SUCCESS: Daily 08:00 digest
+
+**Trigger.** Africa/Tunis cron `0 8 * * *` on WF3.
+
+**Path.**
+
+1. **A1 / n8n WF3** — `Daily 08:00` schedule trigger fires.
+2. **A1 / Correlation Engine :5002** — `/state` returns full bucket list. Say there are 7 open buckets without case IDs.
+3. **A1 / Aggregate queued buckets** — JS produces `{open_count: 7, total_alerts: 42, by_rule: "SOC-007: 30, SOC-013: 12", lines: "- bucket 11 | rule SOC-007 | ip 1.2.3.4 | alerts 8 | sev low\n- ...", bucket_ids: [11,12,13,14,15,16,17]}`.
+4. **A1 / Ollama** — `Ollama: digest summary` with `num_predict: 80` takes ~250 s warm.
+5. **A1 / TheHive create digest case** — POST `/case` with title `[DAILY-DIGEST] 2026-05-12 — 7 queued buckets / 42 alerts`. Description has 3 sections (AI summary, By rule, Buckets) each with `replace(/[\x00-\x1f]/g,' ')` applied to strip control chars.
+6. **A1 / Fan out bucket IDs** — JS emits 7 items each `{bucket_id: N}`.
+7. **A1 / Correlation Engine: /close bucket** — runs 7 times, one per fanned item, marking each bucket closed.
+
+**End state.** Analyst opens TheHive at 08:30, sees one new `[DAILY-DIGEST]` case in SOC-LAB. Reads the AI summary, scans the per-rule breakdown, decides nothing needs follow-up, closes the case. The 7 underlying buckets are already closed in the correlation engine.
+
+### Scenario D — SUCCESS: Monday 04:00 weekly maintenance
+
+**Trigger.** Africa/Tunis cron `0 4 * * 1` on WF5.
+
+**Path.**
+
+1. **A1 / n8n WF5** — `Mondays 04:00` schedule trigger fires.
+2. **A1 / ML API :5000** — `/train` with `{"days":30}`. The ML API queries ES `.alerts-security.alerts-default` for the last 30 days, refits the IsolationForest, persists to `/opt/ml-api/model.pkl`. Returns `{status:"ok", samples: 1234, source: ".alerts-security.alerts-default", trained_at: 1779120000}`.
+3. **A1 / parallel fanout** — `ML: /train (30d)` has 4 outgoing connections. After it completes, the four health-check nodes run in parallel:
+   - `ML: /health` → `{status:"ok", model_loaded:true}`
+   - `Correlation: /state` → full bucket list, e.g. 50 closed / 2 open
+   - `ES: cluster health` → `{status:"yellow", active_shards_percent_as_number: 71}`
+   - `ES: alerts count (7d)` → `{count: 318}`
+4. **A1 / Build maintenance summary** — JS assembles flat summary object.
+5. **A1 / TheHive create maintenance case** — POST `/case` with title `[WEEKLY-MAINT] 2026-05-12 — ML retrained, 318 alerts last 7d`. Severity 1, tags `["PFE","SOC-Lab","weekly-maintenance","automated"]`.
+
+**End state.** Analyst on Monday morning sees the weekly maintenance case in TheHive. ML samples=1234 (real-data training succeeded), es_status=yellow (acceptable for single-node), alerts_7d=318 (pipeline healthy). No action required.
+
+### Scenario E — FAILURE: Cortex analyzer hangs (OTXQuery, pre-patch)
+
+**Trigger.** WF2 dispatches a Cortex OTXQuery job for IP `8.8.8.8` (or any popular IP with millions of passive DNS records).
+
+**Path (pre-patch, broken).**
+
+1. WF2 reaches `Cortex: AbuseIPDB` and possibly `Cortex: OTXQuery` (if a node had been added with the OTXQuery instance UUID).
+2. **B1 / Cortex** — analyzer process starts, runs `otx_query_ip`, calls `OTXv2.getRelated('passive_dns', '8.8.8.8')`. Upstream `requests.get` has no timeout.
+3. **B1 / OTX endpoint** — returns a stream of millions of records.
+4. **B1 / Cortex analyzer** — pulls forever. Cortex worker thread blocked. The job stays in "Running" state for hours.
+5. **B1 / Cortex internal exception handler** — catches everything in a blanket `except Exception`, so even if a sub-call fails, the analyst sees no real error.
+
+**What the analyst sees.** TheHive observable view shows the OTXQuery job stuck "In Progress" indefinitely. AbuseIPDB and VirusTotal reports landed fine (~5 s each); only OTXQuery is stuck. No error message; just no output. Refreshing the page shows the same state. Eventually a Cortex worker timeout (if any) gives a generic "job failed" with no detail.
+
+**Path (post-patch, fixed 2026-05-10).**
+
+1. WF2 dispatches OTXQuery job.
+2. **B1 / Cortex** — patched `otxquery.py` calls `OTXv2.getGeneral`, `getReputation`, `getGeo`, `getMalware` (`passive_dns` and `url_list` sections removed).
+3. Each section call has `timeout=15` on its `requests.get`. Each section is wrapped in its own try/except.
+4. If any section times out or errors, `partial_errors[]` accumulates the failure but the other sections still produce output.
+5. Job completes in ~30 s (slower than AbuseIPDB because of 4 sequential section calls — could be parallelized later).
+
+**End state (post-patch).** OTXQuery report visible on the observable within ~30 s. For 8.8.8.8: 0 pulses (Google DNS not in OTX). For known Tor exit 185.220.101.1: 50 pulses, 1 malicious, identified.
+
+**Why it was missed initially.** The analyzer was registered in Cortex with a valid free-tier key, and the AbuseIPDB / VirusTotal analyzers verified end-to-end. The hang appeared only on certain IPs (popular ones with massive passive DNS), so spot-checks with random lab IPs missed it. Discovered while debugging Cortex enrichment on 2026-05-10.
+
+### Scenario F — FAILURE: TheHive webhook not firing (pre-fix)
+
+**Trigger.** Any WF1 successfully creates a case in TheHive.
+
+**Path (pre-fix, 2026-05-07).**
+
+1. WF1 creates TheHive case successfully (case visible in UI).
+2. TheHive notifier config has trigger `AnyEvent` with `delegate: true` and the n8n-soc webhook endpoint registered.
+3. **B1 / TheHive NotificationActor** — logs `Starting fixed thread pool with 2 threads` at boot, then never emits anything on case create. No errors. Silent.
+4. Audit records ARE created (verified via `listAudit` query). Webhook URL IS reachable from inside the container (curl 200).
+5. WF2 never receives the case-create event. Cortex enrichment never dispatches.
+
+**What the analyst sees.** Cases land in TheHive with observables (after the Phase 10 `wf1-14b-add-observable` was added), but no Cortex reports on the observables. Manually firing the WF2 webhook (curl POST with a fake case envelope) works fine — proving the workflow is correct and the gap is upstream.
+
+**Workaround (Phase 8 / 2026-05-07).** Polling bridge `~/soc-project/thehive-cortex/cron-cases-to-wf2.sh` runs every minute. It queries `listCase` filter `_gt _createdAt` for new cases since its last run (timestamp in ms epoch — `$(date +%s)*1000`, since `date +%s%3N` returned wrong output on this Ubuntu). For each new case it POSTs in TheHive's native envelope shape `{operation:"create", objectType:"Case", objectId, object:<full case>}` to `/webhook/thehive`. Verified end-to-end: case ~32880 → WF2 exec returned 200.
+
+**Path (post-fix, 2026-05-10).**
+
+1. Notifier config simplified to trigger `CaseCreated`, `delegate: false`.
+2. Endpoint registered via system-level `application.conf` (bind-mounted `~/soc-project/thehive-cortex/thehive/conf/application.conf` → `/etc/thehive/application.conf`). Org-level rule persisted on SOC-LAB org config under `socadmin`.
+3. **B1 / TheHive** — `CaseCreated` event fires the notifier; exec 284 fired ~3 min after case #18 was created with no bridge involvement (the bridge fires at most every 60 s; the native notifier was faster).
+4. WF2 receives, runs through normally.
+
+**End state (post-fix).** Native notifier works. Polling bridge remains as fallback because WF2 is idempotent and duplicate POSTs are independent executions.
+
+**Why it didn't work initially.** Configuration shape ambiguity in TheHive 5.7.1's notifier framework — the original tries used `AnyEvent` trigger, `delegate:true`, rules-as-array vs rules-inside-`{endpoints,items}`, all silent. The fix that worked: `CaseCreated` trigger + `delegate:false` + endpoint at system level + rules at org level via `PUT /api/v1/config/organisation/notification`.
+
+### Scenario G — FAILURE: WF3 control-character JSON crash
+
+**Trigger.** WF3 runs at 08:00 with at least one bucket whose `lines` or `by_rule` field contains a literal newline or tab character.
+
+**Path (pre-fix, bug A1-#2 on exec 274, 2026-05-10 07:00 UTC).**
+
+1. Schedule fires, `/state` returns buckets, `Aggregate queued buckets` builds `lines`/`by_rule` strings.
+2. Ollama node either succeeds (returns digest text) or fails (wraps error into output because `neverError:true` + `continueOnFail:true`).
+3. `TheHive: create digest case` interpolates `$json.response`, `$('Aggregate queued buckets').item.json.by_rule`, and `.lines` directly into the JSON body template.
+4. The fields contain real newlines / tabs that aren't JSON-escaped.
+5. n8n's JSON-body interpolation fails with `Bad control character in string literal at position 280`.
+6. Execution errors out; WF3 didn't create a digest case for 2026-05-10.
+
+**What the analyst sees.** No daily-digest case on 2026-05-10 morning. n8n UI execution 274 shows `status: error` at the `TheHive: create digest case` node with the SyntaxError above. Buckets remain open (the `/close` fan-out never ran), so they would re-appear in tomorrow's digest.
+
+**Path (post-fix, current workflow snapshot).**
+
+1. `TheHive: create digest case` wraps every interpolated field in `String(...)` and applies `.replace(/[\x00-\x1f]/g, ' ')` to strip all control characters.
+2. JSON body interpolation succeeds.
+3. Digest case created normally.
+
+**Additional hardening recommendation from CLAUDE.md (not yet applied).** The Ollama node still wraps its error into the output because `neverError: true`. Add an `If` node between Ollama and TheHive that short-circuits on missing `$json.response` and uses a fallback summary string. Otherwise a future Ollama-error case still passes a malformed object downstream.
+
+**Related but resolved (exec 253, 2026-05-08 07:00).** Same node failed with `host is unreachable` because TheHive was offline during the 6-hour ES outage on B1. Permanently fixed by the boot orchestration fix on 2026-05-10. Not a standing issue.
+
+### Scenario H — FAILURE: WF2 AbuseIPDB version-mismatch (404)
+
+**Trigger.** WF2 dispatches an IP observable to Cortex.
+
+**Path (pre-fix).**
+
+1. WF2 reaches `Cortex: AbuseIPDB` node. The node URL was `http://192.168.1.51:9001/api/analyzer/AbuseIPDB_1_0/run`.
+2. **B1 / Cortex** — Cortex logs `warn POST /api/analyzer/AbuseIPDB_1_0/run returned 404`. The installed instance is `AbuseIPDB_2_0` (definition id with version suffix `_2_0`, not `_1_0`).
+3. `neverError: true` on the HTTP node lets the workflow continue but no analyzer job is created.
+
+**What the analyst sees.** TheHive case has the IP observable but no AbuseIPDB report. Looks visually identical to the "Cortex worker not registered" symptom. Debugging requires checking Cortex logs to see the 404.
+
+**Why this came up.** Two related but distinct issues conflated:
+
+1. The HTTP path was using the **definition id with wrong version suffix** (`AbuseIPDB_1_0` instead of `AbuseIPDB_2_0`). The right answer is to use the **instance UUID** anyway, not the definition id — that's portable across version bumps.
+2. Separately, the **AbuseIPDB worker** in Cortex must have a free-tier API key configured in the org's analyzer settings or it won't be registered as a runnable worker, even if the instance is listed. Without the key, Cortex returns "worker AbuseIPDB_2_0 not found" on dispatch attempts.
+
+**Path (post-fix, current workflow snapshot).**
+
+1. WF2's `Cortex: AbuseIPDB` URL is `http://192.168.1.51:9001/api/analyzer/6b1c7570c74b55db697a69aa2c719b4f/run` (instance UUID).
+2. Cortex accepts and queues the job.
+3. AbuseIPDB analyzer (with free-tier key configured in org settings) runs the IP lookup, returns within 1-3 s.
+
+**General rule.** When referencing analyzers in workflow paths, pull live definition IDs at workflow build time or hardcode the **instance UUID** — never the version-suffixed definition id like `AbuseIPDB_2_0`, because the next Cortex-Analyzers release will bump to `_2_1` and your workflow silently breaks.
+
+### Scenario I — FAILURE: TheHive Platinum trial expires (2026-05-14)
+
+**Trigger.** Calendar — the auto-loaded 15-day Platinum trial activated 2026-04-29 expires 2026-05-14.
+
+**What degrades.**
+
+- **License-cap users.** Community license allows the built-in `admin@thehive.local` plus 2 active org users. SOC-LAB currently has 3 active users (admin + soc-bot + socadmin). On expiry one of them must be deactivated or the org consolidated. Probable plan: deactivate `admin@thehive.local` (only needed for first-time setup), keep `soc-bot` (analyst, n8n WF1's bearer) + `socadmin` (org-admin, manages notifier config).
+- **Multi-organisation features.** Cross-org case sharing UI and admin features become restricted. SOC-LAB single-org operation remains fine.
+- **Custom field types.** Some Platinum-only custom field types degrade. Project uses only `string` and numeric severity, so no impact expected.
+- **Advanced dashboards.** Built-in Platinum dashboards downgrade to a basic set.
+- **API rate limiting.** Community may apply tighter limits. WF2 enrichment dispatch could slow if many observables flow at once.
+- **Built-in notification triggers.** Some Platinum-only notification rules may stop working. The current `CaseCreated` trigger is Community-supported, so this shouldn't bite — but worth verifying immediately after expiry.
+
+**What does NOT degrade.**
+
+- Case creation / read / update via API — works on Community
+- Observable management — works on Community
+- Cortex integration — works on Community
+- Existing data and history — fully preserved
+
+**Pre-expiry action items (recommended before 2026-05-14, from CLAUDE.md):**
+
+- Export all 13 Phase 10 cases as JSON via `GET /api/v1/case/{id}` for the rapport evidence trail.
+- Export the SOC-LAB org notifier config and any custom field configs.
+- Decide which 2 users to keep active and document the choice.
+- Schedule a verification re-test of WF1 + WF2 immediately post-expiry to confirm the pipeline still works on Community.
+
+**Fallback if any feature breaks the pipeline.** TheHive 4 OSS (no license cap) is a fallback, but case data is not auto-migrated from TheHive 5 — would require export/import of case JSON. Decision can be deferred until a real Community limitation bites.
+
+---
+
+## 9. Credentials and Keys (Reference Table)
+
+Locations only — never the secret values themselves. The four leaked-in-git secrets are flagged for rotation.
+
+### 9.1 VM_A1 — soc-core
+
+| Name | Where it lives | Type | Status |
+|---|---|---|---|
+| `ELASTIC_PASSWORD` | `~/soc-project/.env.local` (mode 600) | Elasticsearch superuser | Active |
+| `FLEET_SERVER_SERVICE_TOKEN` | `~/soc-project/.env.local` | Fleet Server enrollment | Active |
+| ES CA fingerprint | `~/soc-project/elasticsearch/` | TLS self-signed | Static, displayed in CLAUDE.md (not secret) |
+| `N8N_API_KEY` | `~/soc-project/.env.local` | n8n public API | Active |
+| `N8N_ENCRYPTION_KEY` | `/opt/n8n/.env` (n8n systemd EnvironmentFile) | Encrypts stored credentials | Active |
+| `~/.ssh/soc_response` (ed25519 private) | VM_A1 user home, mode 600 | SSH active-response | Active. Public counterpart deployed on VM_B2. No passphrase. |
+| n8n credential `cTJMkUYUxWVtlD8K` (Elasticsearch) | n8n's encrypted store | httpBasicAuth | Active |
+| n8n credential `Ux32rgVuHoXKc1GY` (TheHive Bearer) | n8n's encrypted store | httpHeaderAuth | Bearer was `THEHIVE_BOT_API_KEY` — **LEAKED IN GIT, ROTATE** |
+| n8n credential `HK1qH743oIbnpSbk` (Cortex Bearer) | n8n's encrypted store | httpHeaderAuth | Bearer reuses `CORTEX_USER_API_KEY` — **LEAKED IN GIT, ROTATE** |
+| n8n credential `VqpfYno0QpnoseF6` (soc-response SSH) | n8n's encrypted store | sshPrivateKey | Active, contains the ed25519 private key |
+
+### 9.2 VM_B1 — incident-mgmt
+
+| Name | Where it lives | Type | Status |
+|---|---|---|---|
+| TheHive admin login | TheHive DB | `admin@thehive.local / <changed-from-secret>` | Active |
+| `THEHIVE_BOT_API_KEY` | `~/soc-project/.env.local` (mode 600) | API key for `soc-bot@thehive.local` (analyst) | **LEAKED IN GIT, ROTATE** |
+| `SOCADMIN_KEY` | `~/soc-project/.env.local` | API key for `socadmin@thehive.local` (org-admin) | **LEAKED IN GIT, ROTATE** |
+| Cortex superadmin login | Cortex DB | superadmin / <set-at-setup> | Active |
+| `CORTEX_SUPERADMIN_API_KEY` | `~/soc-project/.env.local` | API key | Active |
+| `CORTEX_USER_API_KEY` | `~/soc-project/.env.local` | API key for `cortex-user` (analyze + orgadmin), reused by TheHive and by n8n | **LEAKED IN GIT, ROTATE** |
+| MISP admin login | MISP DB | `admin@admin.test / <changed-from-admin>` | Active |
+| `MISP_API_KEY` | `~/soc-project/.env.local` | MISP admin API key | **LEAKED IN GIT, ROTATE** |
+| `ABUSEIPDB_API_KEY` | `~/soc-project/.env.local` | AbuseIPDB free tier (1000/day) | Active |
+| `VIRUSTOTAL_API_KEY` | `~/soc-project/.env.local` | VirusTotal free tier (500/day) | Active |
+| `OTX_API_KEY` | `~/soc-project/.env.local` | AlienVault OTX free | Active |
+| `SUDO_PASS` | `~/soc-project/.env.local` | VM_B1 sudo password | Active |
+| `~/.ssh/id_ed25519` | VM_B1 user home | Git SSH (push to soc-shared) | Active |
+
+### 9.3 VM_B2 — victim-lab
+
+| Name | Where it lives | Type | Status |
+|---|---|---|---|
+| Three weak SSH/FTP accounts | `/etc/passwd`, `/etc/shadow` | Intentional weak creds | Active (lab targets) |
+| `~/.ssh/authorized_keys` on `soc-response` | `/home/soc-response/.ssh/`, mode 600 | n8n auto-block public key | Active. Private counterpart on VM_A1 only. |
+| `/etc/sudoers.d/soc-response` | system, mode 440 | NOPASSWD iptables for soc-response | Active |
+| `DVWA_DB_PASSWORD` | `~/soc-project/.env.local` | random 24-char MariaDB user password | Active |
+| VM_B2 sudo password (`kali`) | `~/soc-project/.env.local` | Active | Intentional weak — lab |
+
+### 9.4 The four leaked secrets requiring rotation
+
+CLAUDE.md flagged on 2026-05-10:
+
+> "Leaked secrets that hit public `soc-shared` CLAUDE.md earlier need rotation (`THEHIVE_BOT_API_KEY`, `SOCADMIN_KEY`, `CORTEX_USER_API_KEY`, `MISP_API_KEY`)."
+
+These were inadvertently committed into `soc-shared/CLAUDE.md` (the Git-tracked, public repo) during the Phase 8 wiring entry on 2026-05-07 before the placeholder discipline was reinforced. The fix is:
+
+1. **Rotate** each key:
+   - TheHive: log in as admin or socadmin, rotate `soc-bot` and `socadmin` API keys via User Profile → API Key.
+   - Cortex: rotate `cortex-user` API key via the Cortex UI.
+   - MISP: rotate admin API key via Administration → List Users.
+2. **Update** the local `.env.local` files on each VM with the new keys.
+3. **Repaste** new bearers into n8n credentials `Ux32rgVuHoXKc1GY` (TheHive) and `HK1qH743oIbnpSbk` (Cortex) via the n8n UI (or `PATCH /api/v1/credentials/{id}` — the n8n public API does expose PATCH on this build, contradicting earlier notes; tested 2026-05-07).
+4. **Force-push history rewrite** is not recommended; the git history is public anyway. Rotation invalidates the leaked values.
+5. **Verify** WF1 still creates cases (re-fire SOC-006 from a fresh source IP) and WF2 still dispatches Cortex jobs after rotation.
+
+### 9.5 Where credentials are NOT stored
+
+- **Never in `soc-shared` Git repo** going forward — CLAUDE.md and docs/ only. This handbook deliberately lists secret *names* and *locations*, never *values*.
+- **Never in `~/soc-project/` files committed anywhere** — `.env.local` files are mode 600 and gitignored.
+- **Never in n8n workflow JSON exports** — n8n redacts credentials on export; the JSON exports in `~/soc-project/n8n/workflows/` reference credential IDs (`cTJMkUYUxWVtlD8K`, `Ux32rgVuHoXKc1GY`, `HK1qH743oIbnpSbk`, `VqpfYno0QpnoseF6`) but contain no secret values.
+
+---
+
+## 10. Outstanding Work
+
+From CLAUDE.md `pending` lists and Phase 10 known gaps, as of 2026-05-12:
+
+### 10.1 Phase 11 — PFE rapport (the only open phase)
+
+The rapport itself. CLAUDE.md sub-steps:
+
+- Final pass on CLAUDE.md to fill all credential placeholders with real values *locally only* (never committed).
+- Generate architecture diagrams: network topology, alert pipeline, AI pipeline, integration map. Save to `~/soc-shared/docs/architecture.md`.
+- Compile metrics: detection rate per layer, average MTTR, false-positive reduction with ML scoring, alerts grouped per case (correlation effectiveness), rules auto-generated from MISP events.
+- Write rapport sections drawing from `~/soc-shared/docs/report-notes.md` accumulated throughout the project.
+- Defend choices: Elastic over Wazuh; Ollama over Claude/OpenAI API; custom Correlation Engine over TheHive built-in alert grouping; Kibana built-in MITRE tagging over a custom Tagger service.
+- List limitations and future work: production scaling, replacing the 8B local model with a stronger one when budget allows, multi-tenancy via TheHive Enterprise.
+- Final commit and Git tag for the defended version.
+
+The metrics to capture (from CLAUDE.md "PFE rapport notes / Metrics to capture during testing"):
+
+- Number of attack scenarios simulated
+- Detection rate per layer (Suricata / Kibana custom / Kibana prebuilt / MISP intel / ML)
+- Average time from attack to TheHive case creation (MTTD)
+- Average alerts per attack before correlation
+- Average alerts per case after correlation (target: ≥ 3:1 reduction — already observed: 36:1 on SOC-006 second batch)
+- False positive rate before vs after ML score gating
+- MITRE ATT&CK technique coverage (techniques covered / techniques in framework)
+- Auto-generated rules from MISP events: count and confidence distribution
+- Latency per service: ML API (~5-20 ms), correlation (~5-20 ms), Ollama (60-600 s)
+- Active response success rate (auto-block firing as expected)
+
+### 10.2 Secret rotation (4 items)
+
+Detailed in Section 9.4 — rotate `THEHIVE_BOT_API_KEY`, `SOCADMIN_KEY`, `CORTEX_USER_API_KEY`, `MISP_API_KEY`. Update `.env.local` files, repaste into n8n credentials.
+
+### 10.3 Platinum trial expiry handling (2026-05-14)
+
+Detailed in Sections 5.5 and 8 / Scenario I. Pre-expiry: export 13 Phase 10 cases, export SOC-LAB org notifier config, decide on the 2-user retention plan.
+
+### 10.4 Detection rules not yet exercised in end-to-end testing
+
+Phase 10 cases #13–#19 cover SOC-001, SOC-003, SOC-004, SOC-005, SOC-006, SOC-011, SOC-012. The remaining four rules are deferred to a focused B2 attack session:
+
+- **SOC-008** Critical system file modified (`TA0003 / T1098`, high) — needs FIM/auditbeat integration which isn't yet attached on B2's policy. The rule currently reports partial-failure (benign) because some of its index targets (`logs-endpoint.events.file-*`, `auditbeat-*`) don't exist on this cluster.
+- **SOC-009** Web shell detected (`TA0003 / T1505.003`, critical + auto_block) — needs a real attempted web shell drop on `/var/www/html/`.
+- **SOC-010** Sudo privilege escalation (`TA0004 / T1548.003`, high) — needs an actual local sudo attempt on B2.
+- **SOC-013** Data exfiltration indicator (`TA0010 / T1048`, high) — needs an actual scp / rsync / wget out of B2 simulating exfiltration.
+
+### 10.5 Two A1-side bugs flagged for the WF owner
+
+From CLAUDE.md 2026-05-10 (B1's entry flags these for A1's owner):
+
+- **Bug A1-#1**: WF2 was using definition-id-with-wrong-version analyzer paths. **Fixed** in current snapshot (uses instance UUIDs). Verify on next run.
+- **Bug A1-#2**: WF3 JSON control-character crash. **Mitigated** in current snapshot via `replace(/[\x00-\x1f]/g,' ')` on every interpolated field. Hardening recommendation (add If-node after Ollama to short-circuit on missing `$json.response`) not yet applied.
+
+### 10.6 Cortex AbuseIPDB worker registration
+
+Phase 10 noted: "Cortex AbuseIPDB analyzer worker not registered (`worker AbuseIPDB_1_0 not found`). Requires user to add free-tier API key in Cortex UI (Org SOC-LAB → Analyzers → enable AbuseIPDB_1_0 with key)."
+
+Per the 2026-05-10 verification on B1, the analyzer **instance** is registered (UUID `6b1c7570c74b55db697a69aa2c719b4f`) with a valid free-tier key — that was the conflation between "naming version mismatch" (the WF2 URL bug) and "missing analyzer key" (a different issue). Confirm by running an end-to-end SOC-006 demo: case → observable → WF2 dispatch → AbuseIPDB report appears within 5 s.
+
+### 10.7 The Suricata interface to A1 pipeline gap items from Phase 10
+
+- VM_B2 was OFFLINE on 2026-05-05 at 21:09Z and rejoined later. Suricata + Apache rules (SOC-003..007, 009, 013) had no live data until B2 came back. Address before any rapport demos.
+- SOC-008 silently no-op until FIM (file integrity monitoring) is added to the system integration on agents. Add to the Phase 11 plan.
+
+### 10.8 The Kibana .webhook trial expiry (2026-06-05)
+
+The 30-day Elastic trial activated 2026-05-06 expires ~2026-06-05. If the rapport defense is after that date and the SIEM is still running, either:
+
+- Re-trial on a fresh cluster (acceptable for a demo lab).
+- Fall back to n8n polling — switch detection rules to a "noop" action and have an n8n workflow poll `.alerts-security.alerts-default` (works on Basic forever, adds polling latency, requires a new workflow).
+
+---
+
+## 11. Operational Cheatsheet
+
+A one-page reference of the commands you'll actually run.
+
+### 11.1 Health check — "is everything up?"
+
+On **VM_A1** (`192.168.1.50`):
+
+```bash
+# Core services
+systemctl status elasticsearch kibana logstash elastic-agent
+systemctl status n8n ollama ml-api correlation-engine
+
+# Quick endpoint pings
+curl -sk -u elastic:$ELASTIC_PASSWORD https://localhost:9200/_cluster/health | jq
+curl -s http://localhost:5601/api/status | jq '.status.overall'
+curl -s http://localhost:5678/healthz
+curl -s http://localhost:11434/api/tags | jq '.models[].name'
+curl -s http://localhost:5000/health
+curl -s http://localhost:5002/state | jq '.buckets | length'
+
+# Logs
+journalctl -u n8n -n 50 --no-pager
+journalctl -u ollama -n 50 --no-pager
+journalctl -u ml-api -n 50 --no-pager
+journalctl -u correlation-engine -n 50 --no-pager
+```
+
+On **VM_B1** (`192.168.1.51`):
+
+```bash
+# Native services
+systemctl status cassandra elasticsearch
+nodetool status
+
+# Docker services
+docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+
+# Endpoint pings
+curl -s http://localhost:9000/api/v1/status/public | jq
+curl -s http://localhost:9001/api/status | jq
+curl -ks https://localhost:8443/users/login | head -1
+
+# Docker logs (TheHive / Cortex / MISP)
+docker logs --tail 50 thehive
+docker logs --tail 50 cortex
+docker logs --tail 50 misp-core
+```
+
+On **VM_B2** (`192.168.1.53`):
+
+```bash
+systemctl status apache2 mariadb vsftpd ssh.socket suricata elastic-agent zerotier-one
+elastic-agent status
+tail -n 5 /var/log/suricata/eve.json | jq
+tail -n 5 /var/log/apache2/access_soc.log
+sudo iptables -L INPUT -n  # check for any lingering auto-block rules
+```
+
+### 11.2 See recent n8n executions
+
+Open browser to `http://192.168.1.50:5678` → log in → **Executions** tab in the left sidebar.
+
+Or via API on VM_A1:
+
+```bash
+# List the last 20 executions
+curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+  "http://localhost:5678/api/v1/executions?limit=20" | jq '.data[] | {id, workflowId, status, startedAt, finished}'
+
+# Inspect a specific execution including all node data
+curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+  "http://localhost:5678/api/v1/executions/<ID>?includeData=true" | jq
+
+# List active workflows
+curl -s -H "X-N8N-API-KEY: $N8N_API_KEY" \
+  "http://localhost:5678/api/v1/workflows?active=true" | jq '.data[] | {id, name}'
+```
+
+### 11.3 Read TheHive logs
+
+```bash
+# Container logs from VM_B1
+docker logs --tail 100 thehive
+docker logs --tail 100 -f thehive   # follow live
+
+# Container app log file (more verbose)
+docker exec thehive tail -100 /var/log/thehive/application.log
+
+# Audit records via API (the trail of every operation)
+curl -s -H "Authorization: Bearer $THEHIVE_BOT_API_KEY" \
+  -H "Content-Type: application/json" \
+  -X POST http://localhost:9000/api/v1/query \
+  -d '{"query":[{"_name":"listAudit"},{"_name":"limit","number":20}]}' | jq
+
+# List the most recent cases
+curl -s -H "Authorization: Bearer $THEHIVE_BOT_API_KEY" \
+  -H "Content-Type: application/json" \
+  -X POST http://localhost:9000/api/v1/query?name=cases \
+  -d '{"query":[{"_name":"listCase"},{"_name":"sort","_fields":[{"_createdAt":"desc"}]},{"_name":"limit","number":10}]}' | jq
+```
+
+### 11.4 Test the WF1 webhook end-to-end
+
+```bash
+# From any VM with ZT reachability to .50
+curl -s -X POST -H "Content-Type: application/json" \
+  http://192.168.1.50:5678/webhook/elastic-alert \
+  -d '{
+    "rule_id": "SOC-001",
+    "rule_name": "SSH brute force",
+    "severity": "medium",
+    "risk_score": 47,
+    "auto_block": false,
+    "results_link": "http://192.168.1.50:5601"
+  }'
+```
+
+Expect HTTP 200. Then inspect WF1's most recent execution in n8n UI to see all 20 nodes' input/output.
+
+### 11.5 Test the WF2 webhook directly (bypass TheHive notifier)
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" \
+  http://192.168.1.50:5678/webhook/thehive \
+  -d '{
+    "operation": "create",
+    "objectType": "Case",
+    "objectId": "~123456",
+    "object": {"_id": "~123456", "title": "test"}
+  }'
+```
+
+Expect `{"received":true}`. Then check WF2's most recent execution.
+
+### 11.6 Trigger WF3 (Daily Digest) manually
+
+In n8n UI: open WF3 → click **Execute Workflow** in the canvas. Or via API:
+
+```bash
+curl -s -X POST -H "X-N8N-API-KEY: $N8N_API_KEY" \
+  "http://localhost:5678/api/v1/workflows/Z1VpjJlhg2Skek1B/execute"
+```
+
+### 11.7 Inspect / clean the Correlation Engine state
+
+```bash
+# Full state
+curl -s http://192.168.1.50:5002/state | jq
+
+# Open buckets only
+curl -s http://192.168.1.50:5002/state | jq '.buckets[] | select(.closed==false)'
+
+# Close a stale bucket
+curl -s -X POST -H "Content-Type: application/json" \
+  http://192.168.1.50:5002/close -d '{"bucket_id": 23}'
+
+# Whitelist a known-good source IP
+curl -s -X POST -H "Content-Type: application/json" \
+  http://192.168.1.50:5002/whitelist/add -d '{"source_ip": "192.168.1.60"}'
+```
+
+### 11.8 Run a Cortex analyzer manually
+
+```bash
+# AbuseIPDB on 8.8.8.8 (replace the UUID if it changes)
+curl -s -H "Authorization: Bearer $CORTEX_USER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -X POST http://192.168.1.51:9001/api/analyzer/6b1c7570c74b55db697a69aa2c719b4f/run \
+  -d '{"data":"8.8.8.8","dataType":"ip","tlp":2,"message":"manual test"}'
+
+# Get the job result (using the job_id returned above)
+curl -s -H "Authorization: Bearer $CORTEX_USER_API_KEY" \
+  http://192.168.1.51:9001/api/job/<JOB_ID>/report | jq
+```
+
+### 11.9 Clear an auto-block rule on VM_B2
+
+```bash
+# On VM_B2, list lingering DROP rules
+sudo /sbin/iptables -L INPUT -n --line-numbers
+
+# Remove a specific rule by source IP
+sudo /sbin/iptables -D INPUT -s 192.168.1.52 -j DROP
+```
+
+### 11.10 Retrain the ML model
+
+```bash
+# On VM_A1
+curl -s -X POST -H "Content-Type: application/json" \
+  http://localhost:5000/train -d '{"days": 30}' | jq
+
+# Quick smoke (synthetic if no real alerts yet)
+curl -s -X POST -H "Content-Type: application/json" \
+  http://localhost:5000/train -d '{"days": 1}' | jq
+```
+
+### 11.11 Tail Suricata events on VM_B2
+
+```bash
+# Live tail of all eve events
+sudo tail -f /var/log/suricata/eve.json | jq -c 'select(.event_type=="alert") | {ts:.timestamp, sig:.alert.signature, src:.src_ip, dest:.dest_ip}'
+
+# Reload Suricata after manual rule edit
+sudo systemctl reload suricata
+sudo journalctl -u suricata -n 50 --no-pager
+```
+
+### 11.12 Reload Kibana detection rules (bulk-patch action body, for instance)
+
+```bash
+# Set rule actions on all SOC-* rules in one shot
+curl -sk -u elastic:$ELASTIC_PASSWORD -H "kbn-xsrf: soc" \
+  -H "Content-Type: application/json" \
+  -X POST "http://localhost:5601/api/detection_engine/rules/_bulk_action" \
+  -d '{
+    "action": "enable",
+    "query": "tags:\"SOC-Custom-13\""
+  }'
+
+# Or import a fresh NDJSON of rules
+curl -sk -u elastic:$ELASTIC_PASSWORD -H "kbn-xsrf: soc" \
+  -F "file=@~/soc-project/kibana/soc-rules.ndjson" \
+  "http://localhost:5601/api/detection_engine/rules/_import?overwrite=true"
+```
+
+### 11.13 Generate a fresh Fleet enrollment token
+
+```bash
+# On VM_A1
+curl -s -u elastic:$ELASTIC_PASSWORD -H "kbn-xsrf: soc" \
+  -H "Content-Type: application/json" \
+  -X POST "http://localhost:5601/api/fleet/enrollment_api_keys" \
+  -d '{"policy_id":"c226ca2c-fcd2-40c8-9ca6-11392fc7e24e",
+       "name":"victim-lab-key-'"$(date +%s)"'"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['item']['api_key'])"
+```
+
+### 11.14 MISP feed manual fetch
+
+```bash
+# On VM_B1
+docker exec -u www-data misp-core cake Server fetchFeed all
+docker exec -u www-data misp-core cake Server cacheFeed all
+
+# Or trigger the cron script directly
+/home/vboxuser/soc-project/misp/cron-feeds.sh
+```
+
+### 11.15 Boot order on VM_B1 (after a reboot)
+
+```bash
+sudo systemctl start cassandra && sleep 40
+sudo systemctl start elasticsearch && sleep 20
+docker compose -f ~/soc-project/thehive-cortex/docker-compose.yml up -d   # TheHive + Cortex
+sleep 30
+docker compose -f ~/soc-project/misp/docker-compose.yml up -d              # MISP
+sleep 20
+docker compose -f ~/soc-project/misp/docker-compose.yml up -d              # re-run if any container reports unhealthy
+```
+
+### 11.16 Pre-rapport export of Phase 10 cases
+
+```bash
+# On VM_B1, export each case as JSON for the rapport evidence trail
+for CASE_ID in 13 14 15 17 18 19; do
+  curl -s -H "Authorization: Bearer $THEHIVE_BOT_API_KEY" \
+    -H "Content-Type: application/json" \
+    -X POST http://localhost:9000/api/v1/query \
+    -d "{\"query\":[{\"_name\":\"getCase\",\"idOrName\":\"$CASE_ID\"}]}" \
+    > ~/soc-shared/docs/case-${CASE_ID}.json
+done
+```
+
+### 11.17 Git workflow for soc-shared updates
+
+```bash
+cd ~/soc-shared
+git pull   # always pull first
+# edit CLAUDE.md or docs/
+git add CLAUDE.md docs/
+git commit -m "phase-N.M: <hostname>: <what was done>"
+git push
+# NEVER add ~/soc-project/ contents to this repo
+```
+
+---
+
+*End of handbook. Generated 2026-05-12.*

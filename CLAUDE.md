@@ -749,17 +749,17 @@ phase_0_git_setup:                    complete       # VM_A1, VM_B1, VM_B2 done;
 phase_1_zerotier:                     complete       # VM_A1 .50 (node 785fd1806c), VM_B1 .51 (node 9ab369cb6c), VM_B2 .53 (node aa429ed844) all reachable; VM_A2 descoped
 phase_2_vm_a1_siem_core:              complete       # ES 8.19.14 single-node (heap dropped 4G→2G in phase 3 to fit Ollama; backup at heap.options.bak-20260505), Kibana 8.19.14, Logstash 8.19.14 (beats:5044, syslog:5140 → ES), Elastic Agent + Fleet Server 8.19.14 on :8220 enrolled in fleet-server-policy. ufw active with allow from 192.168.1.0/24. SOC-Core OS is Ubuntu 26.04 LTS (matches VM_B1, plan said 22.04).
 phase_3_vm_a1_soar_and_ai:            complete       # n8n 2.18.5 systemd on :5678; Ollama 0.22.1 + llama3.1:8b warm with KEEP_ALIVE=24h (cold load ~5min, ~0.3 tok/s CPU-only); 8G swap added. RE-ARCHITECTED: only 2/4 Flask APIs built — ML Anomaly :5000 (IsolationForest, /train pulls .alerts-security.alerts-default), Correlation Engine :5002 (SQLite, 30-min bucket / 2h kill-chain windows; 6 actions verified). DROPPED: NLP API (replaced by n8n→Ollama directly via HTTP node) and MITRE Auto-Tagger (replaced by Kibana's built-in threat[] field at rule definition + Sigma tags + community classtype JSONs). systemd units for ml-api + correlation-engine; /opt/<svc> symlinks back to ~/soc-project/<svc>.
-phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive + Cortex (custom soc-cortex:4.0.1-analyzers image, process mode) + MISP all running; 4 MISP feeds enabled with 6h cron; 4 Cortex analyzers verified end-to-end; ufw active with ZT-only allow rules
+phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive + Cortex (custom soc-cortex:4.0.1-analyzers image, process mode) + MISP all running; 4 MISP feeds enabled with 6h cron; 30 Cortex analyzers active in SOC-LAB org (4 original verified end-to-end + 26 no-key bulk-enabled 2026-05-14); MISP analyzer URL fixed 127.0.0.1→192.168.1.51 (2026-05-14); ufw active with ZT-only allow rules
 phase_5_vm_b2_victim_lab:             complete       # Apache+PHP8.5+MariaDB up; DVWA at /dvwa; vsftpd:21 + ssh:22 + 3 weak users; Suricata 8.0.3 with 49911 ET Open rules; Elastic Agent enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45) HEALTHY; integrations attached on VM_A1 Kibana: system-2 + apache-victim-lab (/var/log/apache2/access_soc.log+access.log+error.log) + suricata-victim-lab (/var/log/suricata/eve.json) + vsftpd-victim-lab (Custom Logs /var/log/vsftpd.log → dataset 'vsftpd'). Used native Suricata + Apache integrations (NOT Custom Logs) — pre-parsed/ECS/dashboards. Suricata index growing live (~58k+ docs at attach time). Active-response wired 2026-05-07: soc-response user (uid 1004, password locked) with VM_A1's ed25519 pubkey in /home/soc-response/.ssh/authorized_keys + /etc/sudoers.d/soc-response NOPASSWD for both /sbin/iptables and /usr/sbin/iptables; verified end-to-end by Phase 10 SQLi test (WF1 SSH+iptables rc=0). SSH brute-force log shape fixed 2026-05-08: PerSourcePenalties no in /etc/ssh/sshd_config.d/99-soc-lab.conf so repeated auth failures emit standard "Failed password" lines instead of OpenSSH 9.x's "penalty: failed authentication" — required for SOC-001/SOC-002 to fire (per VM_A1 Phase 10 note). OBSOLETE: original "MITRE Tagger /scan/suricata cron + /refresh from classification.config" deferred items dropped in Phase 3 re-architecture (Kibana threat[] + Sigma attack.t#### + community classtype JSONs replace it).
 phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
 phase_7_detection_layer_activation:   complete       # 1644 Elastic prebuilt rules installed; ES license trial-activated for .webhook connector; n8n webhook connector id 7c351a6c-4de6-4c07-8146-fa337033c735 (POST → http://192.168.1.50:5678/webhook/elastic-alert); 13 SOC custom rules (SOC-001..SOC-013) imported from ~/soc-project/kibana/soc-rules.ndjson and enabled, all with native MITRE threat[] tagging, webhook action, meta.auto_block flag (true on 002/004/006/009/011); SOC-008 partial-failure benign (FIM indices not yet present); Suricata/Apache rules waiting on VM_B2 to come back online
 phase_8_soar_integration:             complete       # WF1+WF2 ACTIVE; B1 wiring done 2026-05-07: real bearers minted (TheHive=rtHZuTw01P0UwaeDKmcT04bBQZmxvlGM for soc-bot@thehive.local in new SOC-LAB org [analyst profile]; Cortex=existing cortex-user key 6MWnt7E3FdH0muqjoG6Xyd+5msDQf4S2 reused). VM_A1 owner pastes bearers into n8n UI for cred ids Ux32rgVuHoXKc1GY / HK1qH743oIbnpSbk (n8n public API has no PATCH for creds; UI edit keeps id stable). TheHive→WF2 wired via polling bridge (~/soc-project/thehive-cortex/cron-cases-to-wf2.sh, every 1m) — TheHive 5.7.1 native notification.endpoints+items config accepts the rule but actor never dispatches; bridge posts Case JSON in TheHive's native envelope shape ({operation,objectType,objectId,object}) directly to /webhook/thehive. Smoke verified case=~32880 wf2=200.
 phase_9_adaptive_intelligence:        complete       # WF3+WF4+WF5 ACTIVE; MISP→WF4 wired via polling bridge (~/soc-project/misp/cron-publish-to-wf4.sh, every 1m, uses /events/restSearch with publish_timestamp filter — MISP 2.5 has no native single-URL outbound webhook). WF4 Ollama timeout caveat unchanged.
 phase_10_testing:                     complete       # 2026-05-10: 7 SOC rules verified end-to-end (cases #13/14/15/17/18/19 + correlation absorption); 7 bug fixes applied this Phase: #1 sshd→sshd-session OpenSSH 9.x rename (SOC-001/002/012 KQL), #2 SOC-005 KQL bare-`<script>` invalid → URL-encoded only, #3 SOC-011 KQL wildcards-around-quoted-phrase invalid → `message:"bash -i" or ...`, #4 (same as #1 for SOC-012), #5 WF1 source_ip array-of-string fix via IIFE pick-first-IPv4 (Bug confirmed when SOC-011 multi-NIC host emitted JSON-string-of-array breaking JSON body interpolation), #6 SOC-011 self-trigger fix via `not host.name:"soc-core"`, #7 WF2 fetch-observables GET→POST query API (TheHive 5 has no GET /case/{id}/observables; was returning 404 silently breaking Cortex enrichment forever). New WF1 node `wf1-14b-add-observable` added (POST /case/{id}/observable with source_ip → ip dataType, tlp 2, ioc true). Auto-block path verified end-to-end SOC-006 from .52 (kali) → iptables DROP on B2 targeting .52 → A2 lost B2 access, A1 retained access (selective-source verification). WF2 Cortex remaining gap: AbuseIPDB worker not registered (worker not found); requires user-supplied API key in Cortex UI — config gap, not pipeline bug. Latency: fast paths (no NLP) 0.4-2.8s, slow paths (Ollama summarize) 60-632s. Correlation reduction observed: SOC-006 second batch 36 alerts → 1 case via Kibana action summary mode + correlation 30-min bucket; SOC-006 first batch absorbed into existing SOC-012 bucket from same source (escalate_existing).
-phase_11_documentation:               pending
+phase_11_documentation:               in_progress   # handbook delivered 2026-05-14 (docs/SOC-AUTONOME-HANDBOOK.md + .html, 1834 lines covering all 4 VMs / 5 workflows / 9 pipeline scenarios) — PFE rapport itself still pending
 
-last_updated: 2026-05-10
-updated_by: soc-core (VM_A1)
+last_updated: 2026-05-14
+updated_by: incident-mgmt (VM_B1)
 ```
 
 ---
@@ -770,6 +770,97 @@ updated_by: soc-core (VM_A1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-14 — incident-mgmt (VM_B1) — Project handbook delivered + Cortex analyzer expansion (4→30) + MISP analyzer URL fix + perf rescue
+  Done:
+    - PROJECT HANDBOOK delivered: docs/SOC-AUTONOME-HANDBOOK.md
+      (1834 lines, ~18988 words) — full end-to-end description of all 4
+      VMs, network topology, all 5 n8n workflows node-by-node with mermaid
+      flowcharts, TheHive/Cortex/MISP stack, detection stack, 9 pipeline
+      scenarios (4 success + 5 failure modes), credentials reference,
+      outstanding work, operational cheatsheet. Companion
+      docs/SOC-AUTONOME-HANDBOOK.html (self-contained viewer with rendered
+      mermaid + syntax highlighting, opens in any browser, has a print
+      stylesheet for Save-as-PDF).
+    - CORTEX ANALYZER EXPANSION (4 → 30 instances active in SOC-LAB org):
+      Previously enabled: AbuseIPDB, OTXQuery, MISP, VirusTotal_GetReport.
+      Bulk-enabled all 26 no-key analyzers via
+        POST /api/organization/analyzer/{definitionId}
+      with default cfg {auto_extract_artifacts:false, check_tlp:true,
+      max_tlp:2, check_pap:true, max_pap:2}. New analyzers (no API key
+      needed, ready to use immediately):
+        MaxMind_GeoIP, CIRCLHashlookup, Abuse_Finder, TeamCymruMHR,
+        DShield_lookup, ThreatMiner, MaxMind_GeoIP, Mnemonic_pDNS_Public,
+        QrDecode, DomainMailSPFDMARC, Inoitsu,
+        MSDefenderOffice365_SafeLinksDecoder, SpamhausDBL, JA4_FoxIO,
+        Robtex_Forward_PDNS_Query, Urlscan.io_Search, ValidateObservable,
+        Cyberprotect_ThreatScore, Msg_Parser, DNSdumpster_report,
+        CyberCrime-Tracker, Crt_sh_Transparency_Logs, GoogleDNS_resolve,
+        DNS_Lookingglass, Robtex_Reverse_PDNS_Query, Robtex_IP_Query,
+        ClamAV_FileInfo, UnshortenLink.
+    - MISP ANALYZER URL FIX: existing MISP_2_1 instance was configured
+      with url=["https://127.0.0.1:8443"] which never worked — MISP's
+      docker container only binds the ZeroTier IP, not loopback. Patched
+      via PATCH /api/analyzer/{instanceId} (NOT the org enable endpoint
+      which is POST/insert-only and returns 404 on existing instances):
+        url: https://127.0.0.1:8443 → https://192.168.1.51:8443
+      Re-tested with 8.8.8.8 → Success, 0 events matched (expected for
+      a clean IP). MISP analyzer is now end-to-end functional.
+    - LIVE TEST OF ALL 4 ORIGINAL ANALYZERS (post-fix):
+        OTXQuery + 8.8.8.8 → pulse_count=0, ASN AS15169 Google, US ✓
+        AbuseIPDB + 8.8.8.8 → 42 abuse reports (port-scan reporters),
+                                isp=Google LLC, country=US, score=0 ✓
+        VirusTotal_GetReport + EICAR SHA256
+          (275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f)
+          → 66/75 engines malicious, meaningful_name=eicar.com-38682 ✓
+        MISP + 8.8.8.8 → results=[], 0 events matched ✓
+    - PERFORMANCE RESCUE (machine was crashing under load):
+      Diagnosis: load avg 26 / 27 / 25 on 10 cores, %soft=17.66%,
+      %sys=34% — classic VirtualBox I/O virt overhead. Swap thrashing
+      (2.7G/4G used). After Hyper-V removal on host (user ran
+      `bcdedit /set hypervisorlaunchtype off` + reboot) + in-VM cleanup
+      (stopped misp-misp-modules-1 container, disabled GNOME animations,
+      restarted stuck TheHive container which had hung on JanusGraph
+      cluster init), load dropped to 4.5 / 3.6 / 2.4. RAM 7.2/13G, swap
+      unused.
+    - Host-side recommendations given to user (not yet all applied):
+      switch VirtualBox NIC to virtio-net, drop vCPU 10→6/8, drop RAM
+      13→10 GB, disable 3D accel, disable Memory Integrity / Core Isolation
+      in Windows Security, run full
+      `dism /online /disable-feature /featurename:Microsoft-Hyper-V-All`
+      (and VirtualMachinePlatform / HypervisorPlatform / WSL).
+
+  Pending / next session:
+    - 5 test cases (#25–29) left from earlier TheHive notification work
+      titled "PFE webhook ... DELETE ME", tag=DIAG. Auto-mode blocked
+      bulk DELETE — user can clean up via UI.
+    - Cortex still has 0 responders configured. Easy wins: Mailer,
+      MISP_create_event, MISP_WarningLists.
+    - Cortex superadmin-key work pending: SOCADMIN_KEY listed as org-admin
+      only, can't list orgs/users. If superadmin needed for global config,
+      mint one via admin@thehive.local in TheHive (NOT the Cortex
+      superadmin which would also need creation).
+    - Phase 11 (PFE rapport documentation) — handbook is the deliverable
+      input but the rapport itself still pending.
+    - Standing TODOs unchanged: rotate leaked keys in this CLAUDE.md
+      (THEHIVE_BOT_API_KEY, SOCADMIN_KEY, CORTEX_USER_API_KEY, MISP_API_KEY);
+      TheHive Platinum trial expires today (2026-05-14).
+
+  Notes for next instance:
+    - Cortex API gotcha: `POST /api/organization/analyzer/{definitionId}`
+      ONLY creates instances. To update an existing instance, use
+      `PATCH /api/analyzer/{instanceId}` with the full configuration
+      payload — the POST path returns 404 "Worker not found" on existing.
+    - Cortex `/api/analyzer` list endpoint is paginated and returns ONLY
+      10 items by default. Use `?range=all` (or a numeric range like
+      `?range=0-50`) to get the full set. Easy thing to miss.
+    - The MISP analyzer URL trap: even with Cortex in `network_mode: host`,
+      `127.0.0.1:8443` doesn't reach MISP because docker's port publishing
+      `192.168.1.51:8443->80/tcp` ONLY binds the named interface, not the
+      loopback. Always use the ZeroTier IP for MISP.
+    - The `cortex-user` orgadmin key has NO access to /api/organization,
+      /api/user, or analyzer-definition with full structure beyond the
+      basic list. For org/user mgmt, would need a superadmin key.
+
 2026-05-10 — soc-core (VM_A1) — Both A1-side bugs B1 flagged are patched
   Done:
     - Bug A1-#1 (WF2 Cortex analyzer ID mismatch): root cause was deeper
