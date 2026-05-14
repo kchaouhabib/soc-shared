@@ -753,13 +753,13 @@ phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive 
 phase_5_vm_b2_victim_lab:             complete       # Apache+PHP8.5+MariaDB up; DVWA at /dvwa; vsftpd:21 + ssh:22 + 3 weak users; Suricata 8.0.3 with 49911 ET Open rules; Elastic Agent enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45) HEALTHY; integrations attached on VM_A1 Kibana: system-2 + apache-victim-lab (/var/log/apache2/access_soc.log+access.log+error.log) + suricata-victim-lab (/var/log/suricata/eve.json) + vsftpd-victim-lab (Custom Logs /var/log/vsftpd.log → dataset 'vsftpd'). Used native Suricata + Apache integrations (NOT Custom Logs) — pre-parsed/ECS/dashboards. Suricata index growing live (~58k+ docs at attach time). Active-response wired 2026-05-07: soc-response user (uid 1004, password locked) with VM_A1's ed25519 pubkey in /home/soc-response/.ssh/authorized_keys + /etc/sudoers.d/soc-response NOPASSWD for both /sbin/iptables and /usr/sbin/iptables; verified end-to-end by Phase 10 SQLi test (WF1 SSH+iptables rc=0). SSH brute-force log shape fixed 2026-05-08: PerSourcePenalties no in /etc/ssh/sshd_config.d/99-soc-lab.conf so repeated auth failures emit standard "Failed password" lines instead of OpenSSH 9.x's "penalty: failed authentication" — required for SOC-001/SOC-002 to fire (per VM_A1 Phase 10 note). OBSOLETE: original "MITRE Tagger /scan/suricata cron + /refresh from classification.config" deferred items dropped in Phase 3 re-architecture (Kibana threat[] + Sigma attack.t#### + community classtype JSONs replace it).
 phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
 phase_7_detection_layer_activation:   complete       # 1644 Elastic prebuilt rules installed; ES license trial-activated for .webhook connector; n8n webhook connector id 7c351a6c-4de6-4c07-8146-fa337033c735 (POST → http://192.168.1.50:5678/webhook/elastic-alert); 13 SOC custom rules (SOC-001..SOC-013) imported from ~/soc-project/kibana/soc-rules.ndjson and enabled, all with native MITRE threat[] tagging, webhook action, meta.auto_block flag (true on 002/004/006/009/011); SOC-008 partial-failure benign (FIM indices not yet present); Suricata/Apache rules waiting on VM_B2 to come back online
-phase_8_soar_integration:             complete       # WF1+WF2 ACTIVE; B1 wiring done 2026-05-07: real bearers minted (TheHive=rtHZuTw01P0UwaeDKmcT04bBQZmxvlGM for soc-bot@thehive.local in new SOC-LAB org [analyst profile]; Cortex=existing cortex-user key 6MWnt7E3FdH0muqjoG6Xyd+5msDQf4S2 reused). VM_A1 owner pastes bearers into n8n UI for cred ids Ux32rgVuHoXKc1GY / HK1qH743oIbnpSbk (n8n public API has no PATCH for creds; UI edit keeps id stable). TheHive→WF2 wired via polling bridge (~/soc-project/thehive-cortex/cron-cases-to-wf2.sh, every 1m) — TheHive 5.7.1 native notification.endpoints+items config accepts the rule but actor never dispatches; bridge posts Case JSON in TheHive's native envelope shape ({operation,objectType,objectId,object}) directly to /webhook/thehive. Smoke verified case=~32880 wf2=200.
+phase_8_soar_integration:             complete       # WF1+WF2 ACTIVE; B1 wiring done 2026-05-07: real bearers minted (TheHive=rtHZuTw01P0UwaeDKmcT04bBQZmxvlGM for soc-bot@thehive.local in new SOC-LAB org [analyst profile]; Cortex=existing cortex-user key 6MWnt7E3FdH0muqjoG6Xyd+5msDQf4S2 reused). VM_A1 owner pastes bearers into n8n UI for cred ids Ux32rgVuHoXKc1GY / HK1qH743oIbnpSbk (n8n public API has no PATCH for creds; UI edit keeps id stable). TheHive→WF2 wired via polling bridge (~/soc-project/thehive-cortex/cron-cases-to-wf2.sh, every 1m) — TheHive 5.7.1 native notification.endpoints+items config accepts the rule but actor never dispatches; bridge posts Case JSON in TheHive's native envelope shape ({operation,objectType,objectId,object}) directly to /webhook/thehive. Smoke verified case=~32880 wf2=200. WF2 DYNAMIC DISPATCH refactor 2026-05-14 (VM_A1): replaced 8 hardcoded Cortex node fanouts with a single dynamic per-observable dispatcher — Fetch live analyzers (GET /api/v1/connector/cortex/analyzer?range=all → 31 analyzers post-connector-registration) + Build dispatch list (Code, filters by observable.dataType, emits {observableId, analyzerId} pairs) + batched HTTP POST /api/connector/cortex/job (cortexId="SOC-LAB-Cortex", batching {batchSize:1, batchInterval:1500} for Sink.asPublisher race). 16 IP analyzers now dispatched per IP observable (vs hardcoded 4); workflow auto-adapts when org enables more analyzers. Verified case=~162205800: 16 dispatches succeeded, 9 Cortex Success / 5 Cortex Failure (analyzer-side config gaps), 1 InProgress, real cortexJobIds assigned.
 phase_9_adaptive_intelligence:        complete       # WF3+WF4+WF5 ACTIVE; MISP→WF4 wired via polling bridge (~/soc-project/misp/cron-publish-to-wf4.sh, every 1m, uses /events/restSearch with publish_timestamp filter — MISP 2.5 has no native single-URL outbound webhook). WF4 Ollama timeout caveat unchanged.
 phase_10_testing:                     complete       # 2026-05-10: 7 SOC rules verified end-to-end (cases #13/14/15/17/18/19 + correlation absorption); 7 bug fixes applied this Phase: #1 sshd→sshd-session OpenSSH 9.x rename (SOC-001/002/012 KQL), #2 SOC-005 KQL bare-`<script>` invalid → URL-encoded only, #3 SOC-011 KQL wildcards-around-quoted-phrase invalid → `message:"bash -i" or ...`, #4 (same as #1 for SOC-012), #5 WF1 source_ip array-of-string fix via IIFE pick-first-IPv4 (Bug confirmed when SOC-011 multi-NIC host emitted JSON-string-of-array breaking JSON body interpolation), #6 SOC-011 self-trigger fix via `not host.name:"soc-core"`, #7 WF2 fetch-observables GET→POST query API (TheHive 5 has no GET /case/{id}/observables; was returning 404 silently breaking Cortex enrichment forever). New WF1 node `wf1-14b-add-observable` added (POST /case/{id}/observable with source_ip → ip dataType, tlp 2, ioc true). Auto-block path verified end-to-end SOC-006 from .52 (kali) → iptables DROP on B2 targeting .52 → A2 lost B2 access, A1 retained access (selective-source verification). WF2 Cortex remaining gap: AbuseIPDB worker not registered (worker not found); requires user-supplied API key in Cortex UI — config gap, not pipeline bug. Latency: fast paths (no NLP) 0.4-2.8s, slow paths (Ollama summarize) 60-632s. Correlation reduction observed: SOC-006 second batch 36 alerts → 1 case via Kibana action summary mode + correlation 30-min bucket; SOC-006 first batch absorbed into existing SOC-012 bucket from same source (escalate_existing).
 phase_11_documentation:               in_progress   # handbook delivered 2026-05-14 (docs/SOC-AUTONOME-HANDBOOK.md + .html, 1834 lines covering all 4 VMs / 5 workflows / 9 pipeline scenarios) — PFE rapport itself still pending
 
 last_updated: 2026-05-14
-updated_by: incident-mgmt (VM_B1)
+updated_by: soc-core (VM_A1)
 ```
 
 ---
@@ -770,6 +770,123 @@ updated_by: incident-mgmt (VM_B1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-14 (latest) — soc-core (VM_A1) — WF2 dynamic Cortex dispatcher + gaps surfaced for B1
+  Done:
+    - WF2 SURGERY: replaced static 4-analyzer fanout with dynamic
+      per-observable dispatcher. The old WF2 had 8 hardcoded HTTP nodes
+      (one per fixed analyzer ID, organized by Switch-by-dataType branches:
+      ip → AbuseIPDB+VirusTotal+OTX+MISP; hash → 2 nodes; url → 2 nodes).
+      These all referenced analyzer IDs by hand and never auto-updated.
+      Now there is exactly ONE dispatch node that:
+        1) GETs /api/v1/connector/cortex/analyzer?range=all (Fetch live
+           analyzers — 31 analyzers visible since B1's connector
+           registration earlier today)
+        2) Pass observables to loop (Code: passthrough so splitInBatches
+           sees observables, not the analyzer list which auto-splits
+           into 10+ items)
+        3) Loop observables (splitInBatches v3, batchSize 1)
+        4) Build dispatch list (Code, filters analyzers whose dataTypeList
+           includes observable.dataType, emits one item per pair)
+        5) Skip if no analyzer applies (IF on _skip flag)
+        6) Cortex via Hive: dispatch (batched) — POST /api/connector/cortex/job
+           with cortexId="SOC-LAB-Cortex", batching {batchSize:1,
+           batchInterval:1500} for the Sink.asPublisher race
+        7) Loop feedback wired: dispatch leaf + skip-true branch both
+           point BACK to Loop observables — REQUIRED for splitInBatches v3
+           to advance to done branch
+    - Verified end-to-end via case ~162205800 (smoke v6):
+        31 analyzers fetched (up from 10 visible without ?range=all)
+        16 IP-applicable analyzers dispatched on 8.8.8.8 (up from
+          hardcoded 4)
+        16/16 dispatches got real cortexJobIds (vs the "-" failures
+          before the cortexId=SOC-LAB-Cortex fix)
+        Cortex ran the jobs: 9 Success, 5 Failure (analyzer-side
+          issues), 2 still running
+        Threat Intel page generated with DShield "suspicious"
+          verdict (3 threatfeeds)
+    - Bug fixes consumed in this surgery (debug-time mistakes I made and
+      then corrected — recording so next instance doesn't repeat them):
+        #1 cortexId: the dispatch body MUST use "SOC-LAB-Cortex"; if
+           you send "cortex0" or any guess, TheHive accepts the request,
+           creates a Job record with status:Waiting, then within 1s
+           flips it to status:Failure with cortexJobId="-" and
+           analyzerName="-" — silent failure, no useful HTTP-side error
+        #2 splitInBatches v3 needs the per-item branch terminals
+           connected BACK to its own input (feedback cycle) to advance
+           past the first batch — without it, the loop fires once and
+           the "done" output is never reached. Originally the WF2
+           backup had each Cortex POST node terminating with a connection
+           back to "Loop observables (batchSize 1)"; preserve that pattern
+        #3 ?range=all matters: default analyzer endpoint returns ~10
+           items (pagination); always pass ?range=all to enumerate
+        #4 n8n HTTP node auto-splits array responses into one item per
+           array element. A GET that returns a JSON array of 10 analyzers
+           becomes 10 items downstream. To preserve a single item
+           carrying the array, either route the result through a Code
+           passthrough that pulls the original input back, OR (cleaner)
+           don't put the analyzer fetch in the main flow — use $('Fetch
+           live analyzers').all() inside a sibling Code node and route
+           the main flow around it
+        #5 n8n workflow_entity has TWO version-id columns: versionId
+           (editor) and activeVersionId (deployed). Updating only the
+           first leaves the runtime running the old definition. Always
+           bump BOTH and INSERT a matching workflow_history row keyed
+           by the new id; otherwise the next n8n restart still loads
+           the old activeVersionId snapshot
+
+  Pending (B1-side — needs incident-mgmt instance):
+    - CRITICAL: TheHive's Cortex job-status polling is too slow or
+      broken. After WF2 dispatched 16 jobs and Cortex completed 9 of
+      them as Success within 30 seconds, TheHive's listJob view still
+      showed 15/16 as InProgress 8+ minutes later. Direct Cortex query
+      confirms AbuseIPDB job 4zujKJ4BRp6pWzMKtG_t = Success with end
+      timestamp, but TheHive never reflects this. Only DShield happened
+      to sync (probably the very first poll). Symptoms cascade: the
+      observable.reports map only contains DShield, so the WF2 Threat
+      Intel page shows only DShield's verdict even though 9 analyzers
+      returned data.
+      Suggested investigation order:
+        1) Check cortex.refresh-delay / poll interval in
+           ~/soc-project/thehive-cortex/thehive/conf/application.conf
+           — the cortex { servers = [...] } block likely has no refresh
+           override and defaults to something multi-minute
+        2) Inspect TheHive logs for the CortexActor heartbeat to
+           confirm polling is happening at all
+        3) Consider configuring Cortex job-completed webhook to push
+           status to TheHive instead of relying on TheHive's pull
+        Note: this is NOT a Cortex-side bug — Cortex has the answers
+        ready. It is a TheHive→Cortex polling cadence issue.
+    - Analyzer-side gaps (Cortex Failure status) — these are config
+      problems on the analyzers themselves, low priority:
+        AbuseIPDB → needs API key (status Success only because we
+          previously set one; new dispatches still Success on this side)
+        Robtex_Reverse_PDNS_Query, ThreatMiner — likely external
+          service rejection (rate limit / region)
+        CyberCrime-Tracker, ValidateObservable, Abuse_Finder — may
+          need Cortex worker reinstall or analyzer cfg overrides
+    - The previously listed B1 standing items are unchanged: 0 case
+      templates, 0 custom fields, 0 taxonomies imported, only
+      CaseCreated notification trigger, 0 Cortex responders.
+
+  Note for next instance (on any VM):
+    - The WF2 jsonBody hard-codes cortexId="SOC-LAB-Cortex". If B1
+      ever renames its Cortex server, the dispatch will silently fail
+      again. The dispatch jsonBody is in n8n DB (workflow HYiSFNStG5zEG6ZA,
+      node "Cortex via Hive: dispatch (batched)") — there is no
+      .env or external config to update.
+    - WF2 backup before surgery is at
+      ~/soc-project/n8n/workflows/backups/WF2-20260514-203440-pre-dynamic-analyzers.json
+      on VM_A1 (in case rollback ever needed).
+    - The dispatch is on a 1.5s batching interval to dodge TheHive's
+      Sink.asPublisher race. With 16 IP analyzers per IP observable
+      that is 16 × 1.5s ≈ 24s of dispatch time per observable. Cases
+      with multiple IPs scale linearly.
+    - WF2's static "Wait 180s for Cortex jobs" is currently the
+      bottleneck — even if you fix TheHive's polling, the wait still
+      caps total enrichment time. Long-term improvement: replace with
+      a polling loop that exits when all dispatched jobs reach
+      terminal status (Success/Failure) in TheHive's job records.
+
 2026-05-14 (later) — incident-mgmt (VM_B1) — TheHive→Cortex + TheHive→MISP connector servers registered
   Done:
     - Added `cortex { servers = [...] }` and `misp { servers = [...] }`
