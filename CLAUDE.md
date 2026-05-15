@@ -770,7 +770,90 @@ updated_by: incident-mgmt (VM_B1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
-2026-05-15 (latest) — incident-mgmt (VM_B1) — Full project audit + ack of A1's WF2 dispatcher pull + Platinum trial expired
+2026-05-15 (later) — incident-mgmt (VM_B1) — F2 diagnosed: real root cause is F1 (Platinum-tier connector quota=0), not polling cadence
+  Done:
+    - Investigated F2 ("TheHive→Cortex job-status polling stuck"). Pulled
+      the boot section of TheHive's log from the 2026-05-15 19:42 restart
+      (which loaded the application.conf with my refreshDelay/
+      statusCheckInterval values).
+    - Found the actual root cause — the polling code never runs:
+        [warn] CortexClientsSrv: You have reached your quota for Cortex
+                servers, your limit is 0 server(s). Only the first 0
+                servers will work    (printed 2x at boot)
+        [warn] MispClientsSrv:   You have reached your quota for MISP
+                servers, your limit is 0 server(s). Only the first 0
+                servers will work    (printed 3x at boot)
+        [error] CortexActor: Receive a CheckJob for an unknown
+                cortexId: SOC-LAB-Cortex
+        [error] CortexActor: The job ~101839016 has failed: The
+                CortexId SOC-LAB-Cortex is unknown (or no longer used)
+                (15× — one per in-flight job from A1's WF2 dispatch,
+                all auto-failed at TheHive recovery)
+    - Diagnosis: TheHive Platinum trial expired (F1, 2026-05-14 23:59 UTC).
+      Free-tier license enforces 0 Cortex connector servers + 0 MISP
+      connector servers. The connector block in application.conf is
+      parsed correctly but rejected by the license layer. The
+      CortexActor singleton never registers SOC-LAB-Cortex, so the
+      check-job polling cannot fire — every job lookup fails with
+      "unknown cortexId". A1's symptom (15/16 jobs "stuck InProgress")
+      was actually 15/16 jobs auto-failed by TheHive at the next boot
+      with "CortexId unknown".
+    - Conclusion: F2 is not separately fixable. Tuning refreshDelay,
+      switching to webhook push, or any other polling-cadence change
+      cannot succeed while the license quota = 0. F2 is downgraded
+      from "critical B1-actionable" to "blocked-on-F1".
+
+  Implications for the project:
+    - The whole TheHive→Cortex connector path (Run Analyzer UI button,
+      observable.reports synced into case view, MISP auto-pull) is
+      DOWN until F1 is resolved.
+    - The n8n WF2 dispatch path is NOT affected — WF2 hits Cortex
+      directly at http://192.168.1.51:9001, completely bypassing
+      TheHive's connector layer. WF2 will still enrich cases and
+      build Threat Intel pages; it just does it out-of-band rather
+      than via TheHive's native integration.
+    - The WF2 "missing reports" symptom A1 reported (only DShield
+      visible in observable.reports) is real and persists, because
+      WF2 relies on TheHive's connector polling to surface results
+      in the observable card. The workaround is to fetch Cortex
+      reports directly via Cortex API (http://192.168.1.51:9001/
+      api/job/{id}/report) from inside WF2 and write them into the
+      case as comments/task-logs instead of waiting on TheHive's
+      observable.reports map.
+
+  Remediation options for F1 (gated on user decision — no action taken):
+    A) Activate a fresh Platinum trial:
+       Register a new 21-day Enterprise trial at strangebee.com,
+       drop the license file into the container, restart. Simplest
+       path. Buys 21 days. Stack/data untouched.
+    B) Switch to TheHive Community Edition image:
+       Replace strangebee/thehive:5.7.1 with the open-source build
+       (no quota limits, no Cortex connector either — Community
+       does not ship the cortex-connector module). Net loss:
+       same as today. Not recommended.
+    C) Accept free-tier limits, harden WF2 to fetch Cortex reports
+       directly:
+       Modify WF2 to GET /api/job/{cortexJobId}/report against Cortex
+       (192.168.1.51:9001) for each dispatched job, write the
+       summary into the TheHive case via /api/case/{id}/task/_log
+       (which doesn't require the connector quota). Loses the
+       Run-Analyzer UI button but the PFE pipeline keeps working.
+    D) Spin up a separate Cortex client config to Cortex's own API
+       directly from TheHive via a custom plugin — out of scope
+       for the rapport.
+
+  Recommendation: Option A (fresh Platinum trial) for the rapport demo
+  + Option C for the long-term post-defense persistence story. A is
+  fast (~10 min), C is the production-quality answer.
+
+  Not actioned today (gated on user authorization):
+    - Did NOT edit application.conf (no point — config is parsed,
+      then license-rejected)
+    - Did NOT restart TheHive (would not change behavior)
+    - License path needs an explicit go-ahead since it implies
+      strangebee account work / image swap / data migration risk.
+
+2026-05-15 — incident-mgmt (VM_B1) — Full project audit + ack of A1's WF2 dispatcher pull + Platinum trial expired
   Done:
     - Pulled A1's commit 9c832ec ("phase-8: soc-core: WF2 dynamic Cortex
       dispatcher + B1-side polling gap"). WF2 now fans out to all 31
