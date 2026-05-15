@@ -758,8 +758,8 @@ phase_9_adaptive_intelligence:        complete       # WF3+WF4+WF5 ACTIVE; MISP�
 phase_10_testing:                     complete       # 2026-05-10: 7 SOC rules verified end-to-end (cases #13/14/15/17/18/19 + correlation absorption); 7 bug fixes applied this Phase: #1 sshd→sshd-session OpenSSH 9.x rename (SOC-001/002/012 KQL), #2 SOC-005 KQL bare-`<script>` invalid → URL-encoded only, #3 SOC-011 KQL wildcards-around-quoted-phrase invalid → `message:"bash -i" or ...`, #4 (same as #1 for SOC-012), #5 WF1 source_ip array-of-string fix via IIFE pick-first-IPv4 (Bug confirmed when SOC-011 multi-NIC host emitted JSON-string-of-array breaking JSON body interpolation), #6 SOC-011 self-trigger fix via `not host.name:"soc-core"`, #7 WF2 fetch-observables GET→POST query API (TheHive 5 has no GET /case/{id}/observables; was returning 404 silently breaking Cortex enrichment forever). New WF1 node `wf1-14b-add-observable` added (POST /case/{id}/observable with source_ip → ip dataType, tlp 2, ioc true). Auto-block path verified end-to-end SOC-006 from .52 (kali) → iptables DROP on B2 targeting .52 → A2 lost B2 access, A1 retained access (selective-source verification). WF2 Cortex remaining gap: AbuseIPDB worker not registered (worker not found); requires user-supplied API key in Cortex UI — config gap, not pipeline bug. Latency: fast paths (no NLP) 0.4-2.8s, slow paths (Ollama summarize) 60-632s. Correlation reduction observed: SOC-006 second batch 36 alerts → 1 case via Kibana action summary mode + correlation 30-min bucket; SOC-006 first batch absorbed into existing SOC-012 bucket from same source (escalate_existing).
 phase_11_documentation:               in_progress   # handbook delivered 2026-05-14 (docs/SOC-AUTONOME-HANDBOOK.md + .html, 1834 lines covering all 4 VMs / 5 workflows / 9 pipeline scenarios) — PFE rapport itself still pending
 
-last_updated: 2026-05-14
-updated_by: soc-core (VM_A1)
+last_updated: 2026-05-15
+updated_by: incident-mgmt (VM_B1)
 ```
 
 ---
@@ -770,7 +770,95 @@ updated_by: soc-core (VM_A1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
-2026-05-14 (latest) — soc-core (VM_A1) — WF2 dynamic Cortex dispatcher + gaps surfaced for B1
+2026-05-15 (latest) — incident-mgmt (VM_B1) — Full project audit + ack of A1's WF2 dispatcher pull + Platinum trial expired
+  Done:
+    - Pulled A1's commit 9c832ec ("phase-8: soc-core: WF2 dynamic Cortex
+      dispatcher + B1-side polling gap"). WF2 now fans out to all 31
+      analyzers dynamically — supersedes the 4-static-analyzer fanout
+      and resolves the WF2-side enrichment ceiling.
+    - Performed full project round (12 findings, prioritized below).
+      Methodology: re-read all phase states + per-component verification
+      against running stacks on B1 + cross-check against A1's last
+      session note + git history.
+
+  Findings — needs action (priority order):
+    F1 [URGENT/EXPIRED] TheHive Platinum trial expired 2026-05-14 23:59 UTC.
+       Today is 2026-05-15 — already lapsed. Demo cases #13–19 + tag-driven
+       case templates were tied to Platinum features. Export anything still
+       needed before downgrade auto-applies; UI may also drop org-admin
+       views post-expiry. ACTION: dump cases via /api/case/_search +
+       /api/observable/_search to JSON, store under
+       ~/soc-project/thehive-cortex/exports/2026-05-15-pre-downgrade/
+    F2 [CRITICAL — B1] TheHive→Cortex job-status polling stuck (A1
+       surfaced this in 9c832ec). 15/16 jobs InProgress 8+ min after
+       Cortex Success. Likely cause: my application.conf uses
+       `refreshDelay = 1 minute` + `statusCheckInterval = 1 minute` —
+       keys may not even be valid TheHive 5.7 settings (need to verify
+       against TheHive boot log for "unrecognized setting" warnings).
+       Recommended next step: grep TheHive boot log for "cortex" config
+       lines + try `refreshDelay = 10 seconds` (or migrate to Cortex
+       job-completed webhook → TheHive push model). NOT YET ACTIONED —
+       gated on user approval (requires application.conf edit + TheHive
+       restart; Cassandra/ES untouched).
+    F3 [HIGH — A1] WF1 broken (exec 412 errored at TheHive: "create case
+       with invalid syntax"). Today's alert pipeline is dead until fixed.
+       Likely a schema-drift issue introduced when one of WF1's helper
+       nodes was last edited; needs A1-side n8n DB inspection.
+    F4 [HIGH — security] 4 leaked secrets in this CLAUDE.md (Credentials
+       section) to rotate: THEHIVE_BOT_API_KEY, SOCADMIN_KEY,
+       CORTEX_USER_API_KEY, MISP_API_KEY. Repo is public; assume
+       compromised. Rotate + scrub the keys from CLAUDE.md (replace with
+       placeholders like <THEHIVE_BOT_API_KEY> and document fetch path
+       e.g. `vault read soc/thehive`) + update n8n credentials store
+       (A1 owner action for the n8n bearer cred ids Ux32rgVuHoXKc1GY /
+       HK1qH743oIbnpSbk + the WF2 dispatch node).
+    F5 [HIGH — B1] MISP default admin@admin.test / admin still active.
+       Either change password + enable MFA, or create a dedicated
+       PFE admin and disable the default account.
+    F6 [MEDIUM — A1/B1] 4 SOC rules never fired end-to-end:
+       SOC-008 (FIM — indices missing on B2), SOC-009, SOC-010, SOC-013.
+       Phase 10 marked complete but only 7/13 rules verified.
+    F7 [MEDIUM — A1] WF4 Ollama timeout (existing caveat), WF5 weekly
+       maintenance broke 2026-05-11 — A1-side; no recovery yet.
+    F8 [LOW — B1] 5 stale "DELETE ME" test cases (#25–29, tag=DIAG)
+       in TheHive. Auto-mode blocked bulk delete previously; user
+       cleanup via UI still pending. May moot now that Platinum
+       expired (F1).
+    F9 [LOW — B1] Cortex has 0 responders. Mailer + MISP_create_event +
+       MISP_WarningLists are easy wins (no API keys needed for the
+       MISP responders since MISP is local).
+    F10 [LOW — B1] TheHive: 0 case templates, 0 custom fields,
+        0 taxonomies imported. Would make case triage much more
+        structured for the rapport demo.
+    F11 [LOW — B1] MISP catalog under-utilized: 0/168 taxonomies enabled,
+        0/123 warninglists, only 4/96 feeds active. Bulk-enable scripts
+        could be a single curl loop.
+    F12 [DELIVERABLE — all VMs] Phase 11 PFE rapport not written
+        (handbook delivered as input; rapport itself still pending).
+        Also missing: docs/architecture.md, docs/report-notes.md,
+        defended-version git tag, metrics-compilation script.
+
+  Pending (B1-side, needs user authorization before action):
+    - F2 polling fix (application.conf edit — see above for the
+      proposed refreshDelay = 10 seconds change + Cortex webhook
+      alternative)
+    - F1 case export before TheHive Platinum downgrade kicks in fully
+    - F5 MISP default-admin rotation
+    - F9/F10/F11 catalog enablement (low priority, can batch)
+
+  Notes for next instance:
+    - A1's WF2 dispatcher (9c832ec) and B1's connector wiring
+      (1fb97ae) together solved the "Cortex isn't getting reached"
+      side. The remaining enrichment ceiling is TheHive's read-side
+      polling, not the dispatch path — F2 is the single highest-value
+      B1 fix right now.
+    - Soc-shared repo is public on GitHub — F4 secret rotation is not
+      a hypothetical; treat the four keys as already-leaked.
+    - All B1 work today done with the standing constraints intact:
+      Cassandra + local ES untouched, organization+user data untouched,
+      TheHive API key not rotated.
+
+2026-05-14 — soc-core (VM_A1) — WF2 dynamic Cortex dispatcher + gaps surfaced for B1
   Done:
     - WF2 SURGERY: replaced static 4-analyzer fanout with dynamic
       per-observable dispatcher. The old WF2 had 8 hardcoded HTTP nodes
