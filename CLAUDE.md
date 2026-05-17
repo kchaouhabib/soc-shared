@@ -62,9 +62,9 @@ Project files (configs, code) created during the work stay in `~/soc-project/` o
 |---|---|
 | Project name | SOC Autonome — Automation des niveaux L1 et L2 |
 | Type | Projet de Fin d'Études (PFE) |
-| Stack | Elastic 8.x · TheHive 5 · Cortex 4 · MISP · n8n · Suricata · Ollama |
+| Stack | Elastic 8.x · TheHive 5 · Cortex 4 · MISP · n8n · Suricata · cloud Ollama |
 | Detection framework | MITRE ATT&CK |
-| LLM backend | Ollama with `llama3.1:8b` (local, free) |
+| LLM backend | cloud Ollama with `gemma3:4b` — reached from VM_A1 via SSH tunnel through Windows host (`192.168.1.70:11434 → 10.11.21.31`); zero cost. Was `llama3.1:8b` locally on VM_A1 until 2026-05-15. See `PROJECT-MASTER-PLAN.md §6.4 + §16` |
 | Total external cost | Zero |
 | Shared Git repo | https://github.com/kchaouhabib/soc-shared (CLAUDE.md + docs only) |
 | ZeroTier network ID | cf719fd54008e4d1 |
@@ -181,15 +181,15 @@ NLP description, MITRE tags, ML score, Cortex enrichment, response status
 | Logstash | 8.x | 5044 / 5140 | Log preprocessing |
 | Fleet Server (Elastic Agent) | 8.x | 8220 | Central agent management |
 | n8n | latest | 5678 | SOAR / workflow automation |
-| Ollama | latest | 11434 | Local LLM runtime (llama3.1:8b) |
-| ML API | — | 5000 | Isolation Forest anomaly scoring |
-| NLP API | — | 5001 | Alert summarization + AI rule generation |
+| Ollama | latest | 11434 | LLM runtime — **moved to cloud VM `10.11.21.31` on 2026-05-15** running `gemma3:4b`; reached from VM_A1 via SSH tunnel on `192.168.1.70:11434`. Local install uninstalled. |
+| ML API | — | 5000 | Isolation Forest anomaly scoring (still on **synthetic bootstrap** — see Phase 14 pending) |
+| NLP API | — | 5001 | **Scaffold-only / not running.** Folder exists with empty venv; replaced by n8n HTTP-Request → Ollama directly |
 | Correlation Engine | — | 5002 | Alert grouping / deduplication |
-| MITRE Auto-Tagger | — | 5003 | Auto MITRE ATT&CK tagging |
+| ~~MITRE Auto-Tagger~~ | — | ~~5003~~ | **DROPPED** in 2026-05-05 re-architecture — replaced by Kibana `threat[]` field + Sigma `attack.t####` tags + community classtype JSONs |
 
-**Memory budget:**
-- Elasticsearch: 4 GB heap
-- Ollama (llama3.1:8b loaded): ~6 GB
+**Memory budget (post-2026-05-15 Ollama relocation):**
+- Elasticsearch: 2 GB heap (was 4 GB; dropped 2026-05-05; not yet restored after Ollama relocation)
+- ~~Ollama (llama3.1:8b loaded): ~6 GB~~ → freed; runs on cloud VM `10.11.21.31`
 - Logstash: 1 GB heap
 - Kibana: ~1 GB
 - Flask APIs combined: ~1 GB
@@ -485,7 +485,7 @@ POST /generate-rule
 GET  /health
 ```
 
-Backend: Ollama at `http://localhost:11434` with model `llama3.1:8b`.
+Backend: cloud Ollama at `http://192.168.1.70:11434` (SSH tunnel from Windows host to `10.11.21.31`) with model `gemma3:4b`. Local Ollama on VM_A1 was uninstalled 2026-05-15.
 
 ### Correlation Engine (A1:5002)
 
@@ -560,8 +560,10 @@ n8n:
   encryption_key: FILL_AFTER_SETUP
 
 ollama:
-  url: http://localhost:11434
-  model: llama3.1:8b
+  url: http://192.168.1.70:11434   # SSH tunnel from Windows host → 10.11.21.31:11434
+  model: gemma3:4b                  # was llama3.1:8b until 2026-05-15
+  keep_alive: 24h                   # on the cloud VM, not VM_A1
+  recovery: re-establish tunnel manually if Windows host reboots
 
 flask_apis:
   ml_api:        http://192.168.1.50:5000
@@ -748,17 +750,21 @@ Since project files aren't on Git, back them up locally:
 phase_0_git_setup:                    complete       # VM_A1, VM_B1, VM_B2 done; VM_A2 descoped (see notes 2026-04-29)
 phase_1_zerotier:                     complete       # VM_A1 .50 (node 785fd1806c), VM_B1 .51 (node 9ab369cb6c), VM_B2 .53 (node aa429ed844) all reachable; VM_A2 descoped
 phase_2_vm_a1_siem_core:              complete       # ES 8.19.14 single-node (heap dropped 4G→2G in phase 3 to fit Ollama; backup at heap.options.bak-20260505), Kibana 8.19.14, Logstash 8.19.14 (beats:5044, syslog:5140 → ES), Elastic Agent + Fleet Server 8.19.14 on :8220 enrolled in fleet-server-policy. ufw active with allow from 192.168.1.0/24. SOC-Core OS is Ubuntu 26.04 LTS (matches VM_B1, plan said 22.04).
-phase_3_vm_a1_soar_and_ai:            complete       # n8n 2.18.5 systemd on :5678; Ollama 0.22.1 + llama3.1:8b warm with KEEP_ALIVE=24h (cold load ~5min, ~0.3 tok/s CPU-only); 8G swap added. RE-ARCHITECTED: only 2/4 Flask APIs built — ML Anomaly :5000 (IsolationForest, /train pulls .alerts-security.alerts-default), Correlation Engine :5002 (SQLite, 30-min bucket / 2h kill-chain windows; 6 actions verified). DROPPED: NLP API (replaced by n8n→Ollama directly via HTTP node) and MITRE Auto-Tagger (replaced by Kibana's built-in threat[] field at rule definition + Sigma tags + community classtype JSONs). systemd units for ml-api + correlation-engine; /opt/<svc> symlinks back to ~/soc-project/<svc>.
+phase_3_vm_a1_soar_and_ai:            complete       # n8n 2.18.5 systemd on :5678 (DB at nested /home/vboxuser/.n8n/.n8n/database.sqlite). Ollama: ORIGINALLY local llama3.1:8b on VM_A1; UNINSTALLED 2026-05-15 and moved to cloud VM 10.11.21.31 running gemma3:4b — reached from VM_A1 via SSH tunnel on 192.168.1.70:11434 (run from Windows host, must be re-established after host reboot). Active Flask APIs (2/4): ML Anomaly :5000 (IsolationForest, source="synthetic" — Phase 14 pending grounding), Correlation Engine :5002 (SQLite, 30-min bucket / 2h kill-chain windows; 6 actions verified). DROPPED: NLP API (folder scaffold only; replaced by n8n→Ollama HTTP node) and MITRE Auto-Tagger (replaced by Kibana threat[] + Sigma + community classtype JSONs). systemd units for ml-api + correlation-engine; /opt/<svc> symlinks back to ~/soc-project/<svc>.
 phase_4_vm_b1_incident_mgmt:          complete       # Cassandra + ES + TheHive + Cortex (custom soc-cortex:4.0.1-analyzers image, process mode) + MISP all running; 4 MISP feeds enabled with 6h cron; 30 Cortex analyzers active in SOC-LAB org (4 original verified end-to-end + 26 no-key bulk-enabled 2026-05-14); MISP analyzer URL fixed 127.0.0.1→192.168.1.51 (2026-05-14); TheHive→Cortex + TheHive→MISP connector servers registered via thehive/conf/application.conf (cortex.servers + misp.servers, 2026-05-14) — TheHive UI "Run Analyzer" + MISP-pull scheduled actor now functional; ufw active with ZT-only allow rules
 phase_5_vm_b2_victim_lab:             complete       # Apache+PHP8.5+MariaDB up; DVWA at /dvwa; vsftpd:21 + ssh:22 + 3 weak users; Suricata 8.0.3 with 49911 ET Open rules; Elastic Agent enrolled in victim-lab policy (agent_id c328f63a-4d33-437b-9cc1-cdfbb060df45) HEALTHY; integrations attached on VM_A1 Kibana: system-2 + apache-victim-lab (/var/log/apache2/access_soc.log+access.log+error.log) + suricata-victim-lab (/var/log/suricata/eve.json) + vsftpd-victim-lab (Custom Logs /var/log/vsftpd.log → dataset 'vsftpd'). Used native Suricata + Apache integrations (NOT Custom Logs) — pre-parsed/ECS/dashboards. Suricata index growing live (~58k+ docs at attach time). Active-response wired 2026-05-07: soc-response user (uid 1004, password locked) with VM_A1's ed25519 pubkey in /home/soc-response/.ssh/authorized_keys + /etc/sudoers.d/soc-response NOPASSWD for both /sbin/iptables and /usr/sbin/iptables; verified end-to-end by Phase 10 SQLi test (WF1 SSH+iptables rc=0). SSH brute-force log shape fixed 2026-05-08: PerSourcePenalties no in /etc/ssh/sshd_config.d/99-soc-lab.conf so repeated auth failures emit standard "Failed password" lines instead of OpenSSH 9.x's "penalty: failed authentication" — required for SOC-001/SOC-002 to fire (per VM_A1 Phase 10 note). OBSOLETE: original "MITRE Tagger /scan/suricata cron + /refresh from classification.config" deferred items dropped in Phase 3 re-architecture (Kibana threat[] + Sigma attack.t#### + community classtype JSONs replace it).
 phase_6_vm_a2_kali_attacker:          descoped       # user descoped 2026-04-29 — attacks can be launched from any reachable host or skipped
 phase_7_detection_layer_activation:   complete       # 1644 Elastic prebuilt rules installed; ES license trial-activated for .webhook connector; n8n webhook connector id 7c351a6c-4de6-4c07-8146-fa337033c735 (POST → http://192.168.1.50:5678/webhook/elastic-alert); 13 SOC custom rules (SOC-001..SOC-013) imported from ~/soc-project/kibana/soc-rules.ndjson and enabled, all with native MITRE threat[] tagging, webhook action, meta.auto_block flag (true on 002/004/006/009/011); SOC-008 partial-failure benign (FIM indices not yet present); Suricata/Apache rules waiting on VM_B2 to come back online
 phase_8_soar_integration:             complete       # WF1+WF2 ACTIVE; B1 wiring done 2026-05-07: real bearers minted (TheHive=rtHZuTw01P0UwaeDKmcT04bBQZmxvlGM for soc-bot@thehive.local in new SOC-LAB org [analyst profile]; Cortex=existing cortex-user key 6MWnt7E3FdH0muqjoG6Xyd+5msDQf4S2 reused). VM_A1 owner pastes bearers into n8n UI for cred ids Ux32rgVuHoXKc1GY / HK1qH743oIbnpSbk (n8n public API has no PATCH for creds; UI edit keeps id stable). TheHive→WF2 wired via polling bridge (~/soc-project/thehive-cortex/cron-cases-to-wf2.sh, every 1m) — TheHive 5.7.1 native notification.endpoints+items config accepts the rule but actor never dispatches; bridge posts Case JSON in TheHive's native envelope shape ({operation,objectType,objectId,object}) directly to /webhook/thehive. Smoke verified case=~32880 wf2=200. WF2 DYNAMIC DISPATCH refactor 2026-05-14 (VM_A1): replaced 8 hardcoded Cortex node fanouts with a single dynamic per-observable dispatcher — Fetch live analyzers (GET /api/v1/connector/cortex/analyzer?range=all → 31 analyzers post-connector-registration) + Build dispatch list (Code, filters by observable.dataType, emits {observableId, analyzerId} pairs) + batched HTTP POST /api/connector/cortex/job (cortexId="SOC-LAB-Cortex", batching {batchSize:1, batchInterval:1500} for Sink.asPublisher race). 16 IP analyzers now dispatched per IP observable (vs hardcoded 4); workflow auto-adapts when org enables more analyzers. Verified case=~162205800: 16 dispatches succeeded, 9 Cortex Success / 5 Cortex Failure (analyzer-side config gaps), 1 InProgress, real cortexJobIds assigned.
-phase_9_adaptive_intelligence:        complete       # WF3+WF4+WF5 ACTIVE; MISP→WF4 wired via polling bridge (~/soc-project/misp/cron-publish-to-wf4.sh, every 1m, uses /events/restSearch with publish_timestamp filter — MISP 2.5 has no native single-URL outbound webhook). WF4 Ollama timeout caveat unchanged.
+phase_9_adaptive_intelligence:        complete       # WF3+WF4+WF5 ACTIVE; MISP→WF4 wired via polling bridge (~/soc-project/misp/cron-publish-to-wf4.sh, every 1m, uses /events/restSearch with publish_timestamp filter — MISP 2.5 has no native single-URL outbound webhook). WF4 Ollama timeout caveat unchanged (worse now with CPU-only cloud — gemma3:4b takes 30-90s per 600-token gen).
 phase_10_testing:                     complete       # 2026-05-10: 7 SOC rules verified end-to-end (cases #13/14/15/17/18/19 + correlation absorption); 7 bug fixes applied this Phase: #1 sshd→sshd-session OpenSSH 9.x rename (SOC-001/002/012 KQL), #2 SOC-005 KQL bare-`<script>` invalid → URL-encoded only, #3 SOC-011 KQL wildcards-around-quoted-phrase invalid → `message:"bash -i" or ...`, #4 (same as #1 for SOC-012), #5 WF1 source_ip array-of-string fix via IIFE pick-first-IPv4 (Bug confirmed when SOC-011 multi-NIC host emitted JSON-string-of-array breaking JSON body interpolation), #6 SOC-011 self-trigger fix via `not host.name:"soc-core"`, #7 WF2 fetch-observables GET→POST query API (TheHive 5 has no GET /case/{id}/observables; was returning 404 silently breaking Cortex enrichment forever). New WF1 node `wf1-14b-add-observable` added (POST /case/{id}/observable with source_ip → ip dataType, tlp 2, ioc true). Auto-block path verified end-to-end SOC-006 from .52 (kali) → iptables DROP on B2 targeting .52 → A2 lost B2 access, A1 retained access (selective-source verification). WF2 Cortex remaining gap: AbuseIPDB worker not registered (worker not found); requires user-supplied API key in Cortex UI — config gap, not pipeline bug. Latency: fast paths (no NLP) 0.4-2.8s, slow paths (Ollama summarize) 60-632s. Correlation reduction observed: SOC-006 second batch 36 alerts → 1 case via Kibana action summary mode + correlation 30-min bucket; SOC-006 first batch absorbed into existing SOC-012 bucket from same source (escalate_existing).
-phase_11_documentation:               in_progress   # handbook delivered 2026-05-14 (docs/SOC-AUTONOME-HANDBOOK.md + .html, 1834 lines covering all 4 VMs / 5 workflows / 9 pipeline scenarios) — PFE rapport itself still pending
+phase_11_documentation:               in_progress   # handbook delivered 2026-05-14 (docs/SOC-AUTONOME-HANDBOOK.md + .html, 1834 lines — covers 5 of 8 workflows; needs WF6/WF7/WF8 addendum); PROJECT-MASTER-PLAN.md current-state snapshot delivered 2026-05-17 (commit 01f5678); PFE rapport itself still pending
+phase_12_llm_augmentation:            complete       # added 2026-05-15 → 2026-05-17 (commit 01f5678). Five LLM features wired in via gemma3:4b on cloud Ollama: F1 severity-gated email branch (WF1 → Mailtrap Sandbox/Live), F2 Cortex report synthesis (WF2 Threat Intel page AI verdict blockquote), F3 auto-tag (WF1 parallel branch — Ollama format:"json" 4-key classifier → merged tags → PATCH /case), F4 daily-digest narrative (WF3 cron 08:00 Africa/Tunis), F5 full investigation report (WF6, new workflow — 9-section Markdown posted to Reports tab on case close). F6 chatbot (WF7) attempted 2026-05-17 and dropped same day (gemma3:4b 5-8min/Q&A on CPU too slow for chatbot UX; kept deactivated for record).
+phase_13_email_ack_loop:              complete       # added 2026-05-17 (commit 01f5678). WF8 (08 Email Ack) — GET /webhook/email-ack with case_id + recipient query params → parse → fetch case → merge "email-acked" + "email-acked:<short_user>" into tags → POST ack comment + PATCH /case tags → return polished amber-on-navy HTML confirmation page (1184 bytes). WF1 SMTP nodes patched to append clickable link to alert email body. Verified end-to-end on case 44. Public-URL swap (cloudflared) documented but not deployed — link uses ZeroTier IP for the lab.
+phase_14_ml_grounding:                pending        # waiting on encadrent decision re training dataset (A: UNSW-NB15/CIC-IDS2017/NSL-KDD public IDS, B: Atomic Red Team replay on lab, C: LANL Comprehensive Cyber-Security Events). Today's model `source: "synthetic"` — /score returns ~0.62 for both clearly-suspicious and clearly-normal inputs. Adjacent work (no encadrent input needed): expand features 4→8+ (day_of_week, asset_criticality, time_since_last_alert_for_ip, MITRE-tactic histogram); add /classify_tp_fp supervised head trained on TheHive resolved cases.
+phase_15_atomic_red_team:             pending        # independent of Phase 14. Run 3-5 ART tests mapped to existing SOC rules (T1021.004→SOC-012, T1059.004→SOC-006, T1078→SOC-001/002, T1190→SOC-003/004) end-to-end through the pipeline. Log time-to-case, time-to-email, auto_block fire, AI report quality. Strong soutenance demo.
 
-last_updated: 2026-05-15
+last_updated: 2026-05-17
 updated_by: incident-mgmt (VM_B1)
 ```
 
@@ -770,6 +776,61 @@ updated_by: incident-mgmt (VM_B1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
+2026-05-17 (latest) — incident-mgmt (VM_B1) — Reconciled CLAUDE.md to current state per A1's master-plan snapshot (01f5678)
+  Done:
+    - Pulled A1's PROJECT-MASTER-PLAN.md update (commit 01f5678,
+      2026-05-17 19:24 UTC, +224 -6 lines) which snapshots the
+      deployed system as of today — significantly diverged from
+      what CLAUDE.md described.
+    - Reconciled CLAUDE.md to match. Diff highlights:
+        1. Project identity table: LLM backend row rewritten —
+           cloud Ollama gemma3:4b via SSH tunnel from Windows host
+           (192.168.1.70:11434 → 10.11.21.31), not local llama3.1:8b.
+        2. Service catalog table (line ~184): Ollama row marked as
+           relocated to cloud; NLP API marked scaffold-only;
+           MITRE Auto-Tagger marked dropped (was already dropped
+           operationally but still listed live in CLAUDE.md).
+        3. Memory budget: Ollama line struck through; ES heap
+           noted as still at 2 GB (was dropped from 4 GB in May to
+           fit local Ollama, not restored after relocation —
+           candidate cleanup).
+        4. NLP API HTTP section (line ~488) + credentials section
+           (line ~562) — Ollama URL/model lines updated.
+        5. Phase block: phase_3 rewritten to reflect Ollama
+           relocation; phase_9 caveat updated; phase_11 noted as
+           "handbook covers 5/8 workflows — needs addendum";
+           ADDED phase_12 (LLM augmentation — complete),
+           phase_13 (email-ack — complete), phase_14 (ML grounding
+           — pending encadrent), phase_15 (Atomic Red Team —
+           pending).
+        6. last_updated 2026-05-15 → 2026-05-17.
+    - Stale references intentionally left in older session notes
+      (they were correct at write-time; rewriting them would
+      destroy the audit trail). Future readers should treat the
+      phase block + identity table as authoritative, not historical
+      session notes.
+
+  Implications for B1:
+    - F1 (Platinum trial expired 2026-05-14) is now 3 days stale
+      on B1. TheHive UI still in degraded "0 Cortex servers" mode.
+      WF2's dispatch path doesn't care — it hits Cortex directly —
+      so the broader pipeline keeps working through WF2. The
+      missing piece remains the "Run Analyzer" UI button and the
+      MISP-pull scheduled actor; both still gated on F1 remediation
+      (Option A fresh Platinum trial, Option C drop the connector
+      and route through n8n).
+    - All other F-items from the 2026-05-15 audit are unchanged in
+      status.
+
+  Note for next instance (on any VM):
+    - The single source of truth for current state is now
+      PROJECT-MASTER-PLAN.md §16 "Current state snapshot",
+      maintained by soc-core. CLAUDE.md mirrors it for the
+      session-start protocol but the master plan is canonical.
+    - The handbook (docs/SOC-AUTONOME-HANDBOOK.md) is locked to
+      2026-05-14 content (5 workflows). It needs a WF6/WF7/WF8 +
+      Phase 12/13 addendum before the rapport. Not yet started.
+
 2026-05-15 (later) — incident-mgmt (VM_B1) — F2 diagnosed: real root cause is F1 (Platinum-tier connector quota=0), not polling cadence
   Done:
     - Investigated F2 ("TheHive→Cortex job-status polling stuck"). Pulled
