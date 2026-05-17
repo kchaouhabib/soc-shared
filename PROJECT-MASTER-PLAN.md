@@ -131,23 +131,58 @@ ZeroTier was chosen over bridged networking because the two physical PCs may be 
 
 **n8n** — workflow automation engine ("SOAR" — Security Orchestration, Automation and Response). The glue between all services. Receives alerts, calls APIs, makes decisions, creates cases, runs SSH commands for active response. Self-hosted, free for personal/academic use.
 
+n8n state lives in SQLite at `/home/vboxuser/.n8n/.n8n/database.sqlite` (note the nested `.n8n/.n8n/` path). Encryption key for n8n credentials is in `/home/vboxuser/.n8n/.n8n/config`. n8n is managed by systemd unit `/etc/systemd/system/n8n.service` (`Restart=on-failure`, runs as `vboxuser`, env vars including `N8N_USER_FOLDER=/home/vboxuser/.n8n`, `WEBHOOK_URL=http://192.168.1.50:5678/`). Workflow JSON exports kept in `/home/vboxuser/soc-project/n8n/workflows/` for redeploy; operator scripts that build/patch workflows directly against the SQLite DB live in `/tmp/wf*.py`.
+
+The deployed catalogue has **eight workflows** (see §16 for IDs and current verification status):
+
+| # | Name | Trigger | Purpose |
+|---|---|---|---|
+| WF1 | 01 Alert Pipeline | webhook `/elastic-alert` | Receives every detection-engine alert → correlation → ML score → AI summary → TheHive case + email + auto-tag + severity-gated email-to-analyst + active response (iptables) |
+| WF2 | 02 Cortex Enrichment | webhook `/thehive` (via polling bridge) | On new TheHive case: fetch observables → dispatch all applicable Cortex analyzers → AI synthesis of reports → post Threat Intel page to case |
+| WF3 | 03 Daily Digest | cron 08:00 Africa/Tunis | Aggregate queued low-severity buckets → AI narrative → single digest case in TheHive |
+| WF4 | 04 MISP → AI Rule Gen | webhook `/misp` (via polling bridge) | On new MISP event: AI generates `{kibana_rule, suricata_rule, mitre}` JSON → import disabled to Kibana (analyst-in-loop) |
+| WF5 | 05 Weekly Maintenance | cron Mon 04:00 | Calls `POST :5000/train` to retrain Isolation Forest on last 30 days of ES alerts |
+| WF6 | 06 Investigation Report | webhook `/thehive-case-resolved` | On case close: fetch full case context → AI multi-section investigation report (9 sections) → post Markdown page under Reports tab |
+| WF7 | 07 Q&A Chatbot | (deactivated) | Attempted comments-as-chatbot — built but dropped 2026-05-17, see §16 |
+| WF8 | 08 Email Ack | webhook `/email-ack` | Analyst clicks "I'm on it" link in alert email → posts ack comment + adds `email-acked:<user>` tag → renders polished confirmation HTML page |
+
 ### 6.4 Custom AI / Intelligence Services (built for this project)
 
 These are the original contributions of the PFE — **two Flask microservices** that solve problems no built-in covers, plus n8n workflows that orchestrate stock components for everything else.
 
 > **Re-architecture note (2026-05-05):** The original plan called for five Flask services. Two of them were dropped during Phase 3 because stock components already cover the same job. This made the stack smaller and more defendable. See *Dropped services* at the bottom of this section.
 
-**Ollama (port 11434)** — local LLM runtime. Runs llama3.1:8b on VM_A1. Powers all AI features in the project without any API cost. Replaces what would otherwise be Anthropic/OpenAI calls. Slower and slightly less capable than Claude or GPT-4, but free and self-contained. Configured with `OLLAMA_KEEP_ALIVE=24h` to keep the model warm in RAM (cold load is ~5 min from disk on this VM).
+**Ollama (port 11434)** — local LLM runtime. Originally ran llama3.1:8b on VM_A1; **moved 2026-05-15 to a separate cloud VM at `10.11.21.31`** to reclaim ~6 GB RAM on VM_A1. Now reachable from VM_A1 via an SSH port-forward through the Windows host (`192.168.1.70:11434` on ZeroTier → `127.0.0.1:11434` on `10.11.21.31`). Active model swapped from `llama3.1:8b` to `gemma3:4b` — faster on CPU (~2× tokens/sec on this hardware) and produces cleaner JSON in `format:"json"` mode for the structured-output features. Configured with `OLLAMA_KEEP_ALIVE=24h` on the cloud VM. Local Ollama on VM_A1 has been **uninstalled**.
 
-**ML Anomaly Detection API (port 5000)** — Flask service running an Isolation Forest model. Every alert that enters the system gets an anomaly score (0–1). High score = unusual = likely a real threat. Low score = matches normal patterns = probably routine. Used by n8n to gate which alerts become full cases versus go to a daily digest. Bootstraps from a synthetic alert distribution on first start, retrains via `POST /train` on the last 30 days of `.alerts-security.alerts-default` once real data accumulates. Kept because no Basic-tier Elastic feature provides equivalent scoring (Anomaly Detection jobs require a Platinum subscription).
+**ML Anomaly Detection API (port 5000)** — Flask + gunicorn at `/home/vboxuser/soc-project/ml-api/app.py`, systemd unit + `/opt/ml-api/` symlink to `~/soc-project/ml-api/`. Runs an Isolation Forest model from sklearn. Every alert that enters the system gets an anomaly score (0–1). High score = unusual = likely a real threat. Used by n8n WF1 between the correlation step and case creation. Bootstraps from a synthetic alert distribution on first start (1000 alerts, 5% anomalous), retrains via `POST /train` on the last 30 days of `.alerts-security.alerts-default` once real data accumulates. Kept because no Basic-tier Elastic feature provides equivalent scoring (Anomaly Detection jobs require a Platinum subscription).
 
-**Correlation Engine (port 5002)** — Flask service with SQLite state. Decides whether each incoming alert creates a new case or attaches to an existing one. 30-minute same-(source_ip, rule_id) bucket window for storm dedup; **2-hour cross-tactic kill-chain window** that escalates a case the moment a second MITRE tactic appears from the same source IP. Whitelist for known-good IPs; daily-digest queue for low-severity, low-anomaly alerts. Solves the "1 attack = 7 cases" problem and the alert-fatigue problem in one place. The biggest original contribution of the project — kill-chain detection across MITRE tactics is not built into Kibana alert suppression or TheHive 5 case grouping.
+> **Honest current state (2026-05-17):** the model has only ever been refit on the **synthetic bootstrap**. Source field reports `source: "synthetic"`. The 13 lab rules don't produce a meaningful training distribution — `POST /train` on `.alerts-security.alerts-default` falls back to synthetic because real production alert volume is what gets the 30-day pull above the 50-alert floor. Choice of public training dataset (UNSW-NB15 / CIC-IDS2017 / NSL-KDD) or Atomic Red Team-generated alerts is pending discussion with the encadrent before the model is retrained on grounded data. Features today are minimal (`risk_score`, hash of `rule_id`, hash of `source_ip`, `hour_of_day`); enriching with `day_of_week`, `asset_criticality`, `time_since_last_alert_for_ip`, MITRE-tactic histogram is on the post-encadrent backlog.
+
+**Correlation Engine (port 5002)** — Flask + gunicorn at `/home/vboxuser/soc-project/correlation-engine/app.py`, systemd unit + `/opt/correlation-engine/` symlink. SQLite state at `/opt/correlation-engine/state.db`. Decides whether each incoming alert creates a new case or attaches to an existing one. 30-minute same-(source_ip, rule_id) bucket window for storm dedup; **2-hour cross-tactic kill-chain window** that escalates a case the moment a second MITRE tactic appears from the same source IP. Whitelist for known-good IPs; daily-digest queue for low-severity, low-anomaly alerts. Solves the "1 attack = 7 cases" problem and the alert-fatigue problem in one place. The biggest original contribution of the project — kill-chain detection across MITRE tactics is not built into Kibana alert suppression or TheHive 5 case grouping.
+
+**LLM-driven features (orchestrated entirely by n8n + cloud Ollama, no Flask wrapper):**
+
+After the 2026-05-05 re-architecture there is no NLP Flask service. The `~/soc-project/nlp-api/` folder exists as a scaffold (empty Python venv + a `prompts/` directory) but is intentionally not running — all LLM calls go through n8n HTTP-Request nodes with `format:"json"` straight to Ollama. The seven AI features live inside n8n workflows:
+
+| Feature | Workflow | Node(s) |
+|---|---|---|
+| Alert summarization for TheHive case description | WF1 | `Ollama: summarize` |
+| AI-written analyst alert email (8-section structured output) | WF1 | `Ollama: write alert email` → `SMTP: send to analyst` / `SMTP: send via Mailtrap Live (prod)` |
+| Auto-tagging (4-key MITRE/asset/confidence classifier, `format:"json"`) | WF1 | `Ollama: tag case` → `Build merged tags` → `TheHive: PATCH case tags` |
+| Cortex report synthesis (2-paragraph verdict prepended to Threat Intel page) | WF2 | `Build LLM input from reports` → `Ollama: synthesize threat intel` |
+| Daily-digest 4-sentence narrative | WF3 | Ollama call inside the aggregation Code path |
+| AI rule generation (`{kibana_rule, suricata_rule, mitre}` JSON) | WF4 | Ollama node with `format:"json"` + analyst-in-loop import-disabled |
+| Full investigation report (9-section structured Markdown on case close) | WF6 | `Build report context` → `Ollama: write investigation report` → `Format report markdown` → `TheHive: post Investigation Report page` |
+
+**Attempted-and-dropped (kept on record for the rapport):**
+
+- ~~**WF7 — Q&A chatbot via TheHive comments (poll-based)**~~ — built 2026-05-17, deactivated same day. Pattern was: `@bot <question>` in a case comment → 15s scheduled poll detects it → fetch case context → Ollama answer → reply posted as comment from `soc-bot@thehive.local`. Two architectural problems killed it in testing: (a) n8n's per-node `$json` scoping vs. multi-source fan-in made the prompt-assembly node fragile and required two patch passes; (b) gemma3:4b on CPU-only cloud Ollama takes 5–8 minutes per Q&A — too slow to feel like a chatbot. Deactivated, not deleted, so the schema and lessons are preserved. See WF7 in the workflow_entity table (`active=0`).
 
 **Dropped services (replaced by built-ins or n8n+Ollama):**
 
-- ~~**NLP Summarization API (port 5001)**~~ — replaced by an n8n HTTP-Request node calling Ollama directly with `format:"json"`. Prompt templates live in the n8n workflow JSON. No Flask wrapper buys us anything.
+- ~~**NLP Summarization API (port 5001)**~~ — replaced by n8n HTTP-Request nodes calling Ollama directly with `format:"json"`. Prompt templates live in the n8n workflow JSON. No Flask wrapper buys us anything.
 - ~~**MITRE Auto-Tagger (port 5003)**~~ — Kibana's detection-engine UI/API already takes MITRE tags via its `threat[]` field at rule definition time; Elastic prebuilt rules ship pre-tagged; Sigma carries `attack.t####` tags through `sigma2elastic`; community classtype-to-MITRE JSONs cover Suricata's gaps. Building a TF-IDF tagger duplicates these built-ins.
-- ~~**AI Rule Generator (was part of NLP API)**~~ — re-implemented as an n8n workflow node: MISP webhook → HTTP-Request to Ollama with `format:"json"` returning `{kibana_rule, suricata_rule, tactic_id, technique_id}` in one round-trip → Kibana API push + Suricata SSH deploy.
+- ~~**AI Rule Generator (was part of NLP API)**~~ — re-implemented as a node in WF4 (see above).
 
 ### 6.5 Vulnerable Target Layer (VM_B2 only)
 
@@ -418,7 +453,72 @@ Sub-steps:
 - List limitations and future work: production scaling considerations, replacing 8B local model with stronger model when budget allows, multi-tenancy via TheHive Enterprise
 - Final commit and Git tag for the defended version
 
-**Outcome:** Defendable PFE with complete documentation and demonstrable system.
+**Outcome:** Defendable PFE with complete documentation and demonstrable system. Project handbook delivered 2026-05-14 at `~/soc-shared/docs/SOC-AUTONOME-HANDBOOK.md` (and the self-contained `.html` companion). PFE rapport itself still pending.
+
+---
+
+### Phase 12 — LLM augmentation features (added 2026-05-15 → 2026-05-17)
+**Goal:** Move the LLM from "summarize the alert" to a real first-line analyst assistant by adding structured-output features at every stage of the SOC workflow. All features use the same cloud Ollama tunnel (`http://192.168.1.70:11434 → 10.11.21.31`) with model `gemma3:4b` and `format:"json"` where output structure matters. No new Flask services — everything lives inside existing or new n8n workflows.
+
+Sub-steps:
+- **F1. Severity-gated email branch (WF1):** new branch off `TheHive: create case` — Notification config (Set node, recipients/from_address/severity_threshold/`notify_env`), IF severity high/critical, Ollama writes the email body (8 sections: verdict / confidence / summary / kill_chain / threat_actor / immediate+short-term actions / FP-check / containment), IF env=test → Mailtrap Sandbox, env=prod → Mailtrap Live. Mailtrap Live free tier (1000/month) delivers from `@demomailtrap.co`. Email design uses TheHive amber+navy palette + animated SVG shield (SMIL pulsing animation works in Apple Mail + most webmail).
+- **F2. Cortex report synthesis (WF2):** between `fetch observables with reports` and `Build Threat Intel page markdown`, inject `Build LLM input from reports` (Code) → `Ollama: synthesize threat intel` (HTTP, JSON-escape via `JSON.stringify($json.prompt_input || "").slice(1, -1)` to survive newlines/quotes inside the report content). Output prepended as `🤖 AI Threat Intel Synthesis` blockquote on the Threat Intel page.
+- **F3. Auto-tag (WF1):** parallel branch off `TheHive: create case` — `Ollama: tag case` (HTTP, `format:"json"`, 4-key classifier `{kill_chain_stage, threat_actor, asset_criticality, confidence}`) → `Build merged tags` (Code, whitelist values + dedup-merge with existing case tags) → `TheHive: PATCH case tags` (HTTP PATCH `/api/v1/case/{id}`, requires top-level `authentication: 'genericCredentialType'` + `genericAuthType: 'httpHeaderAuth'` + `timeout: 60000` because PATCH on a case can take ~11s).
+- **F4. Daily digest narrative (WF3):** repointed legacy Ollama URL `127.0.0.1:11434` → `192.168.1.70:11434` (cloud tunnel) and swapped `llama3.1:8b` → `gemma3:4b`. Prompt upgraded to produce a 4-sentence narrative covering the day's activity, dominant techniques, and one recommended next action.
+- **F5. Full investigation report (WF6, new workflow):** TheHive case-close webhook → 10-node chain. Builder script `/tmp/wf6_create_investigation_report.py` seeds it into the SQLite DB (workflow_entity + workflow_history + shared_workflow with `projectId=ZKstdJDMMM6gaT37`, role `workflow:owner`). Final pattern after two debug passes: build entire prompt inside the `Build report context` Code node and pass to Ollama via `"prompt": {{ JSON.stringify($json.full_prompt) }}` (no per-field slice tricks). Output is a 9-section Markdown page with emojis + tables (executive_summary, root_cause, impact_assessment, incident_timeline, kill_chain_mapping, iocs, analyst_actions_taken, recommendations, lessons_learned), POSTed as a page under the case's Reports tab.
+- **F6. Q&A chatbot (WF7, attempted then dropped):** see §6.4 and §16.
+
+**Outcome:** Every SOC interaction surface now has an AI feature attached: email (F1), Threat Intel page (F2), case tags (F3), daily digest (F4), Reports tab on case close (F5). All verified end-to-end with case 44 (`~163868784`) over 2026-05-15 → 2026-05-17.
+
+---
+
+### Phase 13 — Email acknowledgement feedback loop (added 2026-05-17)
+**Goal:** Close the human-in-the-loop: when an L1 analyst clicks the "I'm on it" link in the WF1 alert email, the SOC system records the acknowledgement on the TheHive case without manual UI work.
+
+Sub-steps:
+- **F7. WF8 webhook receiver** (new workflow, built via `/tmp/wf8_email_ack.py`):
+  1. `Webhook (email click)` (GET `/webhook/email-ack`, `responseMode: responseNode`)
+  2. `Parse query + build ack` (Code) — extract `case_id` + `recipient` query params, compute `short_user` (recipient prefix, normalized), build comment body + tag name
+  3. `Fetch case` (POST `/api/v1/query` with `getCase` to retrieve existing tags)
+  4. `Build patch body` (Code) — merge existing tags with `email-acked` + `email-acked:<short_user>`. Critical lesson: must reference `$('Parse query + build ack').first().json` explicitly because `$json` resolves to the prior node's output (the case object), losing the original ack fields.
+  5. `Post ack comment` (POST `/api/v1/case/{case_id}/comment`)
+  6. `Patch case tags` (PATCH `/api/v1/case/{case_id}` with merged tags)
+  7. `Build HTML response` (Code) — render a polished amber-on-navy confirmation page
+  8. `Respond to browser` (respondToWebhook node, `text/html; charset=utf-8`)
+- **WF1 SMTP nodes patched** (`SMTP: send to analyst` + `SMTP: send via Mailtrap Live (prod)`) to append a one-line URL: `http://192.168.1.50:5678/webhook/email-ack?case_id={{ $('TheHive: create case').item.json._id }}&recipient={{ encodeURIComponent(recipients.split(',')[0].trim()) }}`. Most mail clients auto-linkify the URL, so the existing `emailFormat: text` body stays as-is — no HTML conversion needed.
+- **Public-URL note:** for the demo, the webhook URL uses the ZeroTier IP `192.168.1.50:5678`, which is reachable from any ZT-joined demo machine. Production deployment would swap it for a public tunnel (cloudflared quick tunnel or a named cloudflare tunnel). cloudflared was **not** installed for this PFE iteration — kept as a documented production swap rather than a lab requirement.
+
+**Outcome:** End-to-end loop verified 2026-05-17 against case 44 — clicking the link returned HTTP 200 with the 1184-byte HTML page, posted comment `📬 **Alert email acknowledged** by \`kchaou.habib67@gmail.com\` at <iso-timestamp>`, and added tags `email-acked` + `email-acked:kchaou.habib67`. The case's audit trail shows the analyst was on the case within seconds of email delivery.
+
+---
+
+### Phase 14 — ML grounding (pending, encadrent input required)
+**Goal:** Move the Isolation Forest from synthetic bootstrap to a model trained on a defensible dataset. Currently the model's `source: "synthetic"` and `/score` returns ~0.62 for both clearly-suspicious and clearly-normal inputs — i.e., it has no discrimination power against real-world distributions.
+
+Candidates surveyed (decision deferred to encadrent):
+- **A.** Public IDS dataset (UNSW-NB15 / CIC-IDS2017 / NSL-KDD). Defensible academic citation, schema mismatch with current 4-feature alert vector — needs a feature-mapping bridge.
+- **B.** Atomic Red Team / Caldera replay against the lab. Generates real ES alerts from real adversary techniques; auto-labels by technique. ~2–3 hr setup. Best demo story.
+- **C.** LANL Comprehensive Cyber-Security Events. Real production data with red-team labels, ~12 GB, host-events not network flows — schema mismatch is heaviest here.
+
+Adjacent work that does NOT need encadrent input:
+- Expand feature set from 4 → 8+ (`day_of_week`, `asset_criticality`, `time_since_last_alert_for_ip`, MITRE-tactic histogram, geo-country, payload-entropy hash).
+- Add a second supervised head: TP/FP classifier trained on TheHive's resolved cases with `resolutionStatus` labels. Slot it next to `/score` as `/classify_tp_fp`.
+
+**Outcome (when complete):** WF1 receives a meaningful anomaly score that gates real triage decisions instead of being a placeholder. The choice of training dataset becomes a defendable rapport bullet rather than an open question.
+
+---
+
+### Phase 15 — Pipeline validation via Atomic Red Team (pending, independent of ML choice)
+**Goal:** Validate the existing pipeline end-to-end against MITRE-aligned adversary tests, not just the 13 hand-crafted SOC rules. Both for soutenance demo strength and to surface gaps in the prebuilt Elastic rule coverage.
+
+Sub-steps (to run when ready):
+- Clone Red Canary's Atomic Red Team: `git clone https://github.com/redcanaryco/atomic-red-team` (Linux bash tests path is `atomics/T1XXX/...`). Pin the commit to a known-good ref for reproducibility.
+- Pick 3-5 atomic tests that map to existing SOC rules (e.g., **T1021.004 SSH lateral movement → SOC-012**, **T1059.004 Unix shell → SOC-006**, **T1078 valid accounts → SOC-001/SOC-002**, **T1190 exploit public-facing app → SOC-003/SOC-004**).
+- Run one test at a time on VM_B2 (and/or VM_A1 if testing host-events on soc-core itself). Watch the full chain: Elastic agent picks up auth/process telemetry → rule fires → correlation engine → WF1 → TheHive case + email + ack link + WF2 enrichment.
+- For each test, log: rule that fired, time-to-case, time-to-email, did auto_block fire if applicable, did the AI report on case-close make sense given the actual attack performed.
+- Optional Phase 15b: enable a curated subset of Elastic's ~1000 prebuilt detection rules in Kibana before running ART tests, to demonstrate the system handles a much larger rule corpus than the 13 customs.
+
+**Outcome (when complete):** Empirical evidence in the rapport that the pipeline works against real attacker behavior, not just synthetic webhook firings. Strong demo moment for the soutenance: "this is the system reacting to a real MITRE-mapped attack technique, live."
 
 ---
 
@@ -614,3 +714,121 @@ If a sub-step fails or behaves unexpectedly:
 - **MISP first run:** Some Docker containers are unhealthy on first startup. Run `docker compose up -d` again to settle.
 - **TheHive 5 default password:** `admin@thehive.local / secret`. Change immediately on first login.
 - **Local backups matter:** Since `~/soc-project/` isn't on Git, a VM failure means lost work. Run periodic rsync or VM snapshots.
+- **n8n DB path quirk:** Real n8n state is at `/home/vboxuser/.n8n/.n8n/database.sqlite` (nested `.n8n/.n8n/`). The outer `/home/vboxuser/.n8n/database.sqlite` exists but is the old/decoy one — confusing on a cold restart. Backups follow the same nested path, named `database.sqlite.bak-<purpose>-<epoch>`.
+- **n8n version trap:** every workflow row has TWO version columns — `versionId` (editor head) and `activeVersionId` (deployed runtime). After surgery you must update BOTH and insert a matching `workflow_history` row, else next restart loads the old definition silently OR activation fails with "Active version not found for workflow".
+- **n8n RBAC required:** any new workflow needs a row in `shared_workflow` linking it to `projectId=ZKstdJDMMM6gaT37` with role `workflow:owner`, else activation fails with "Could not find any entity of type SharedWorkflow".
+- **n8n restart pattern:** there's no `sudo` in the harness and the REST API requires auth, so the only way to reload workflow code after DB surgery is `kill -9 $(pgrep -f 'n8n start')`. systemd's `Restart=on-failure` + `RestartSec=10` brings it back; workflows re-activate after ~25 s.
+- **n8n HTTP node auth trap:** for HTTP-Request nodes that need a credential, the top-level params MUST include `authentication: 'genericCredentialType'` + `genericAuthType: 'httpHeaderAuth'` (or `httpBasicAuth`, `sshPrivateKey`, etc.). Setting only the `credentials` object on the node silently drops the auth header.
+- **`neverError: true` masks real errors:** the WF6 investigation report rendered "_(missing)_" in every section for several runs because Ollama returned `{error: ...}` instead of `{response: ...}` and the formatter only checked for `.response`. Always inspect `item.json` for an `error` key, even on successful executions.
+- **n8n expression scoping:** inside a Code or HTTP node, `$json` refers to the **immediately prior node's output** — not the original webhook payload. To pull fields from earlier nodes use `$('NodeName').first().json.fieldName`. WF7 and WF8 both wasted a debug cycle on this.
+- **Ollama on CPU is slow:** `gemma3:4b` at ~600 tokens generates in 30–90 s; 1500-token reports take 5–8 min. WF6 timeouts must allow at least `timeout: 600000`. Any feature that requires sub-30-second LLM response (e.g., chatbot UX) is not feasible on this hardware without a GPU.
+- **Cloud Ollama tunnel must be up:** the SSH port-forward `ssh -L 192.168.1.70:11434:127.0.0.1:11434 root@10.11.21.31` is run from the Windows host (`192.168.1.70`). If the host reboots, the tunnel must be re-established manually. All LLM features fail with `ECONNREFUSED` until then.
+
+---
+
+## 16. Current state snapshot (as of 2026-05-17)
+
+### Service status — VM_A1 (192.168.1.50)
+
+| Service | State | Path / managed by | Notes |
+|---|---|---|---|
+| Elasticsearch 8.19.14 | ✅ running | systemd `elasticsearch.service` · config `/etc/elasticsearch/` · 2 GB heap (`/etc/elasticsearch/jvm.options.d/heap.options`) | yellow status normal for single-node |
+| Kibana 8.19.14 | ✅ running | systemd `kibana.service` · config `/etc/kibana/kibana.yml` | UI at `http://192.168.1.50:5601` |
+| Logstash 8.19.14 | ✅ running | systemd `logstash.service` · pipeline `/etc/logstash/conf.d/soc-pipeline.conf` | beats:5044 + syslog:5140 |
+| Elastic Agent (Fleet Server) | ✅ running | `/opt/Elastic/Agent/elastic-agent.yml` | :8220 |
+| n8n 2.18.5 | ✅ running | systemd `/etc/systemd/system/n8n.service` · DB `/home/vboxuser/.n8n/.n8n/database.sqlite` · config `/home/vboxuser/.n8n/.n8n/config` (encryption key) | UI at `http://192.168.1.50:5678` |
+| Ollama (local) | ❌ uninstalled 2026-05-15 | n/a | moved to cloud VM `10.11.21.31`, reached via SSH tunnel on `192.168.1.70:11434` |
+| ML API (Isolation Forest) | ✅ running | `/home/vboxuser/soc-project/ml-api/app.py` · model `/home/vboxuser/soc-project/ml-api/model.pkl` · venv `/home/vboxuser/soc-project/ml-api/venv/` · symlink `/opt/ml-api/` | port 5000, `source: "synthetic"` |
+| NLP API | ❌ scaffold only | folder `/home/vboxuser/soc-project/nlp-api/` exists with empty venv + `prompts/` subdir | intentionally not built — n8n+Ollama replaces it |
+| Correlation Engine | ✅ running | `/home/vboxuser/soc-project/correlation-engine/app.py` · state DB `/opt/correlation-engine/state.db` · symlink `/opt/correlation-engine/` | port 5002 |
+
+### Service status — VM_B1 (192.168.1.51)
+
+TheHive 5.7.1 + Cortex 4.0.1 + MISP all running (Docker compose stack at `~/soc-project/thehive-cortex/docker-compose.yml`). Custom `soc-cortex:4.0.1-analyzers` image with 30 enabled analyzers. TheHive `application.conf` bind-mounted from `~/soc-project/thehive-cortex/thehive/conf/application.conf` includes `notification.endpoints` (n8n webhook), `cortex.servers` (`SOC-LAB-Cortex`), `misp.servers` (`SOC-LAB-MISP`).
+
+### Service status — VM_B2 (192.168.1.53)
+
+Apache + DVWA + MariaDB + vsftpd + OpenSSH + Suricata 8.0.3 (49,911 ET Open rules) + Elastic Agent enrolled in `victim-lab` policy. Active-response wired via `soc-response` user + `/etc/sudoers.d/soc-response` NOPASSWD for iptables.
+
+### Active n8n workflows
+
+All in `/home/vboxuser/.n8n/.n8n/database.sqlite` (table `workflow_entity`). All have a matching `shared_workflow` row linking to `projectId=ZKstdJDMMM6gaT37` with role `workflow:owner`. JSON exports kept in `/home/vboxuser/soc-project/n8n/workflows/`.
+
+| # | Name | ID | Trigger | State | Last verified |
+|---|---|---|---|---|---|
+| 1 | 01 Alert Pipeline | `dKSF2AU9E3k9i25p` | POST `/webhook/elastic-alert` | active | Phase 10 (2026-05-10) + WF1 patches through 2026-05-17 |
+| 2 | 02 Cortex Enrichment | `HYiSFNStG5zEG6ZA` | POST `/webhook/thehive` (polling bridge) | active | 2026-05-15 (Cortex synthesis added) |
+| 3 | 03 Daily Digest | `Z1VpjJlhg2Skek1B` | cron 08:00 Africa/Tunis | active | 2026-05-15 (narrative + cloud Ollama) |
+| 4 | 04 MISP → AI Rule Gen | `SbXmkucPC24njKwb` | POST `/webhook/misp` (polling bridge) | active | known limitation: Ollama 10-min timeout vs CPU latency |
+| 5 | 05 Weekly Maintenance | `ekXEZb2PYaxQt7vv` | cron Mon 04:00 | active | depends on real alert volume to do meaningful work |
+| 6 | 06 Investigation Report | `Srr7LavaermzMzB9` | POST `/webhook/thehive-case-resolved` | active | 2026-05-17 (exec 453 — 9-section Markdown report posted to case 44) |
+| 7 | 07 Q&A Chatbot | `wf7QAchatbotXXX1` | Schedule (15s) | **deactivated 2026-05-17** | dropped — too slow on CPU; kept as record |
+| 8 | 08 Email Ack | `wf8EmailAckXXXX1` | GET `/webhook/email-ack` | active | 2026-05-17 (verified end-to-end on case 44) |
+
+### Polling bridges (TheHive notifier replacement, on VM_B1)
+
+| Script | Cron | Purpose |
+|---|---|---|
+| `/home/vboxuser/soc-project/thehive-cortex/cron-cases-to-wf2.sh` | every 1m | poll `listCase` filtered on `_createdAt > last_seen` → POST each new case in TheHive's native envelope to `http://192.168.1.50:5678/webhook/thehive` (fires WF2) |
+| `/home/vboxuser/soc-project/misp/cron-publish-to-wf4.sh` | every 1m | poll MISP `/events/restSearch` filtered on `publish_timestamp > last_seen` → POST to `http://192.168.1.50:5678/webhook/misp` (fires WF4) |
+| `/home/vboxuser/soc-project/misp/cron-feeds.sh` | every 6h | docker-exec MISP `cake Server fetchFeed/cacheFeed all` |
+
+### Operator scripts (workflow surgery — `/tmp/wf*_*.py` on VM_A1)
+
+These are one-shot Python scripts that read/write `~/.n8n/.n8n/database.sqlite` directly to build or patch workflows. Not production code. Listed here so they can be re-applied if the DB is ever rebuilt from snapshot. Kept on this VM only.
+
+| Script | What it does |
+|---|---|
+| `/tmp/wf1_ollama_repoint.py` | re-points WF1 Ollama node URL from local `127.0.0.1:11434` to cloud tunnel `192.168.1.70:11434` |
+| `/tmp/wf1_thehive_template_fix.py` | fixes nested-`{{}}` template error in WF1 `TheHive: create case` description |
+| `/tmp/wf1_add_email_branch.py` | adds the 5-node email branch (Notification config + IF severity + Ollama email + SMTP send + NoOp) off `TheHive: create case` |
+| `/tmp/wf1_add_dev_prod_smtp_split.py` | adds IF-env switch between Mailtrap Sandbox (test) and Mailtrap Live (prod) |
+| `/tmp/wf1_add_autotag_branch.py` | adds the parallel auto-tag branch (Ollama JSON classifier → Build merged tags → TheHive PATCH) |
+| `/tmp/wf2_add_cortex_synthesis.py` | adds Build LLM input + Ollama synthesize nodes to WF2; modifies Build Threat Intel page to prepend AI verdict |
+| `/tmp/wf6_create_investigation_report.py` | builds WF6 from scratch (10 nodes, case-resolved webhook → fetch → Build context → Ollama → format → POST page) |
+| `/tmp/wf6_truncate_inputs.py` | caps comments/tasks/observables passed to Ollama (MAX_COMMENTS=25, MAX_TASKS=15, MAX_OBS=15) to keep prompt bounded |
+| `/tmp/wf6_build_prompt_in_code.py` | final WF6 fix — moves prompt assembly into the Code node, uses `{{ JSON.stringify($json.full_prompt) }}` in HTTP body |
+| `/tmp/wf7_create_qa_chatbot.py` | builds WF7 (Q&A chatbot — dropped) |
+| `/tmp/wf8_email_ack.py` | builds WF8 (Email Ack receiver) |
+
+### Email infrastructure (Mailtrap)
+
+| Account | Use | Credentials |
+|---|---|---|
+| Mailtrap Sandbox (`sandbox.smtp.mailtrap.io:587`) | dev/test — captures emails, no real delivery | n8n credential id `7YLKQqTyNppHWMxk` ("Mailtrap SMTP") |
+| Mailtrap Email Sending (`live.smtp.mailtrap.io:587`) | prod — real delivery from `@demomailtrap.co`, free 1000/month | n8n credential id `l8P27YAe3qV0c09j` ("Mailtrap Live SMTP") |
+| Brevo SMTP | tried 2026-05-15, free tier needs manual account activation, dropped | n8n credential id `DPadrRfl55A5p0os` (kept for reference) |
+| Gmail SMTP | rejected by user 2026-05-15 ("don't want my account to be the one sending") | n8n credential id `HSGSnULcOP2cDnar` (unused) |
+
+WF1's `Notification config` Set node holds `recipients` (comma-separated), `severity_threshold`, `notify_env` (`test`/`prod`), `from_address`. `notify_env` selects between Mailtrap Sandbox (test) and Mailtrap Live (prod).
+
+### Cloud Ollama tunnel
+
+```
+analyst's laptop (Windows host @ 192.168.1.70) ─── SSH -L ───► cloud VM @ 10.11.21.31
+                                                                   │
+                                                              ollama serve
+                                                              :11434, gemma3:4b loaded
+                                                              OLLAMA_KEEP_ALIVE=24h
+```
+
+Command run from Windows host: `ssh -L 192.168.1.70:11434:127.0.0.1:11434 root@10.11.21.31`. Must be re-established manually if Windows host reboots. All LLM features in WF1/WF2/WF3/WF4/WF6 target `http://192.168.1.70:11434/api/generate`.
+
+### Key documentation files (on VM_A1, under `~/soc-shared/`)
+
+| File | Purpose |
+|---|---|
+| `~/soc-shared/CLAUDE.md` | shared brain — phase status, last-session notes, VM profiles, credentials placeholders. Updated every session, lives on Git. |
+| `~/soc-shared/PROJECT-MASTER-PLAN.md` | this file — the master plan + current state snapshot. |
+| `~/soc-shared/README.md` | repo intro |
+| `~/soc-shared/docs/SOC-AUTONOME-HANDBOOK.md` | 1834-line end-to-end handbook delivered 2026-05-14 — all 4 VMs, all workflows node-by-node with mermaid flowcharts, 9 pipeline scenarios. Source for the rapport. |
+| `~/soc-shared/docs/SOC-AUTONOME-HANDBOOK.html` | self-contained HTML version of the handbook (rendered mermaid + syntax highlighting, has print stylesheet for Save-as-PDF) |
+| `~/soc-shared/docs/session-history.md` | archive of older CLAUDE.md last-session entries |
+
+### What's pending right now (2026-05-17)
+
+1. **Phase 14 — ML grounding:** waiting on encadrent input re training dataset choice (UNSW-NB15 / CIC-IDS2017 / Atomic Red Team / other).
+2. **Phase 15 — Atomic Red Team pipeline validation:** independent of (1), can start whenever — install ART, pick 3-5 techniques mapped to SOC rules, run end-to-end against the pipeline.
+3. **Phase 11 finish — PFE rapport:** handbook is the input; rapport sections still to write.
+4. **Polish pass:** email design, Cortex synth markdown, auto-tag rendering, investigation report layout. Deferred earlier in favor of feature breadth.
+5. **Optional public-URL swap:** if WF8 email-ack is to work for analysts outside the ZeroTier overlay (e.g., real Gmail inbox on a phone), the link target needs to move from `http://192.168.1.50:5678/...` to a cloudflared / ngrok / named tunnel URL. Documented as production-deployment swap, not a lab blocker.
