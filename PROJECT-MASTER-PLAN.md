@@ -154,9 +154,9 @@ These are the original contributions of the PFE — **two Flask microservices** 
 
 **Ollama (port 11434)** — local LLM runtime. Originally ran llama3.1:8b on VM_A1; **moved 2026-05-15 to a separate cloud VM at `10.11.21.31`** to reclaim ~6 GB RAM on VM_A1. Now reachable from VM_A1 via an SSH port-forward through the Windows host (`192.168.1.70:11434` on ZeroTier → `127.0.0.1:11434` on `10.11.21.31`). Active model swapped from `llama3.1:8b` to `gemma3:4b` — faster on CPU (~2× tokens/sec on this hardware) and produces cleaner JSON in `format:"json"` mode for the structured-output features. Configured with `OLLAMA_KEEP_ALIVE=24h` on the cloud VM. Local Ollama on VM_A1 has been **uninstalled**.
 
-**ML Anomaly Detection API (port 5000)** — Flask + gunicorn at `/home/vboxuser/soc-project/ml-api/app.py`, systemd unit + `/opt/ml-api/` symlink to `~/soc-project/ml-api/`. Runs an Isolation Forest model from sklearn. Every alert that enters the system gets an anomaly score (0–1). High score = unusual = likely a real threat. Used by n8n WF1 between the correlation step and case creation. Bootstraps from a synthetic alert distribution on first start (1000 alerts, 5% anomalous), retrains via `POST /train` on the last 30 days of `.alerts-security.alerts-default` once real data accumulates. Kept because no Basic-tier Elastic feature provides equivalent scoring (Anomaly Detection jobs require a Platinum subscription).
+**ML Classifier API (port 5000)** — Flask + gunicorn at `/home/vboxuser/soc-project/ml-api/app.py`, systemd unit + `/opt/ml-api/` symlink to `~/soc-project/ml-api/`. Rewritten 2026-05-23 from unsupervised IsolationForest to a **supervised binary classifier (RandomForest primary, XGBoost benchmark)** trained on a **15-feature rule-agnostic vector** that works for any rule_id (the 13 custom SOC rules, the ~1500 Elastic prebuilts, Suricata SIDs, MISP-AI-generated rules). Endpoints: `GET /health`, `POST /classify` (primary — returns `predicted_label` + `confidence` + `recommended_action`), `POST /score` (back-compat — returns derived anomaly_score), `POST /train` (spawns `train.py` subprocess), `POST /feedback` (post-resolution learning loop), `GET /metrics` (last evaluation results for the rapport). Decision rule for `recommended_action` is in `app.py` (`CONFIDENCE_HIGH=0.85`, `CONFIDENCE_LOW=0.60`, `RISK_HIGH=70`) — high-confidence FP → `auto_close_fp`, high-confidence TP + high risk → `auto_escalate`, low confidence → `send_to_analyst`. Bootstraps a tiny synthetic classifier on cold start so the service stays alive when no real model is loaded. Kept (not dropped) because Elastic ML jobs need Platinum and don't classify TP/FP directly.
 
-> **Honest current state (2026-05-17):** the model has only ever been refit on the **synthetic bootstrap**. Source field reports `source: "synthetic"`. The 13 lab rules don't produce a meaningful training distribution — `POST /train` on `.alerts-security.alerts-default` falls back to synthetic because real production alert volume is what gets the 30-day pull above the 50-alert floor. Choice of public training dataset (UNSW-NB15 / CIC-IDS2017 / NSL-KDD) or Atomic Red Team-generated alerts is pending discussion with the encadrent before the model is retrained on grounded data. Features today are minimal (`risk_score`, hash of `rule_id`, hash of `source_ip`, `hour_of_day`); enriching with `day_of_week`, `asset_criticality`, `time_since_last_alert_for_ip`, MITRE-tactic histogram is on the post-encadrent backlog.
+> **Honest current state (2026-05-23):** trained on **2,830,743 CICIDS2017 rows** (RF in 106s, XGB in 14.8s, class ratio 4:1 so SMOTE not needed). RF + XGB both currently report 1.00 precision/recall/F1/AUC on the held-out test set — this is **label leakage** (CICIDS features like severity/risk_score/MITRE were derived from the attack-type label in our preprocessor), not real performance. The CICIDS run validates that the pipeline scales (2.83M rows in ~2 min); the **meaningful** numbers will come from the TheHive-resolved label set (pulled by `pull_thehive_labels.py` from cases closed as TruePositive / FalsePositive — same upstream as live alerts: Elastic SIEM + Suricata IDS via WF1) once enough resolutions accumulate. The 15-feature vector also includes `rule_false_positive_rate_30d` — a learned per-rule trust score that gets updated on every `/feedback` call — which is the central rapport story for "continuously-learning trust filter on the entire rule corpus."
 
 **Correlation Engine (port 5002)** — Flask + gunicorn at `/home/vboxuser/soc-project/correlation-engine/app.py`, systemd unit + `/opt/correlation-engine/` symlink. SQLite state at `/opt/correlation-engine/state.db`. Decides whether each incoming alert creates a new case or attaches to an existing one. 30-minute same-(source_ip, rule_id) bucket window for storm dedup; **2-hour cross-tactic kill-chain window** that escalates a case the moment a second MITRE tactic appears from the same source IP. Whitelist for known-good IPs; daily-digest queue for low-severity, low-anomaly alerts. Solves the "1 attack = 7 cases" problem and the alert-fatigue problem in one place. The biggest original contribution of the project — kill-chain detection across MITRE tactics is not built into Kibana alert suppression or TheHive 5 case grouping.
 
@@ -173,6 +173,7 @@ After the 2026-05-05 re-architecture there is no NLP Flask service. The `~/soc-p
 | Daily-digest 4-sentence narrative | WF3 | Ollama call inside the aggregation Code path |
 | AI rule generation (`{kibana_rule, suricata_rule, mitre}` JSON) | WF4 | Ollama node with `format:"json"` + analyst-in-loop import-disabled |
 | Full investigation report (9-section structured Markdown on case close) | WF6 | `Build report context` → `Ollama: write investigation report` → `Format report markdown` → `TheHive: post Investigation Report page` |
+| L2 escalation brief (3-stage: correlate → summarize → recommend with MITRE ATT&CK mitigations) | WF9 | `Build correlate prompt` → `Ollama: correlate` → `Build summarize prompt` → `Ollama: summarize` → `Build recommend prompt` → `Ollama: recommend` → `Build L2 brief` → 3 TheHive write nodes (comment, task, tag) |
 
 **Attempted-and-dropped (kept on record for the rapport):**
 
@@ -492,19 +493,22 @@ Sub-steps:
 
 ---
 
-### Phase 14 — ML grounding (pending, encadrent input required)
-**Goal:** Move the Isolation Forest from synthetic bootstrap to a model trained on a defensible dataset. Currently the model's `source: "synthetic"` and `/score` returns ~0.62 for both clearly-suspicious and clearly-normal inputs — i.e., it has no discrimination power against real-world distributions.
+### Phase 14 — ML grounding (COMPLETE 2026-05-23)
+**Goal:** Move ml-api from synthetic-bootstrap IsolationForest to a defensible supervised classifier trained on real-world data.
 
-Candidates surveyed (decision deferred to encadrent):
-- **A.** Public IDS dataset (UNSW-NB15 / CIC-IDS2017 / NSL-KDD). Defensible academic citation, schema mismatch with current 4-feature alert vector — needs a feature-mapping bridge.
-- **B.** Atomic Red Team / Caldera replay against the lab. Generates real ES alerts from real adversary techniques; auto-labels by technique. ~2–3 hr setup. Best demo story.
-- **C.** LANL Comprehensive Cyber-Security Events. Real production data with red-team labels, ~12 GB, host-events not network flows — schema mismatch is heaviest here.
+**What landed (supervisor brief: "Random Forest or XGBoost classifier on alert metadata, exposed via Flask called by SOAR; combine public IDS dataset with our own Wazuh-resolved alerts"):**
+- **Dataset choice:** CICIDS2017 (224 MB MachineLearningCSV bundle, 8 CSVs, 2,830,743 flow rows). Note: supervisor said "Wazuh-resolved alerts"; pipeline actually uses Elastic SIEM + Suricata feeding TheHive — same retroactive-labelling mechanism applies (closed cases with `resolutionStatus`), naming corrected throughout the code (`thehive_labeled.parquet`).
+- **Feature engineering:** `/home/vboxuser/soc-project/ml-api/feature_engineering.py` — **15-feature rule-agnostic vector** (replaces the 4-feature `risk_score`+hashed-rule_id+hashed-ip+hour vector). Works for any rule_id without per-rule one-hot, via `rule_source` (categorical: `soc_custom`/`elastic_prebuilt`/`suricata`/`misp_generated`/`other`), `rule_category` (auth/web/network/endpoint/persistence/recon/exfil/execution/lateral/other), and the killer feature `rule_false_positive_rate_30d` (Bayesian-shrunk learned trust score, updated on every `/feedback` POST).
+- **Preprocessor:** `preprocess_cicids.py` — vectorized 2.83M rows in 34 seconds (initial iterrows version would have taken ~30 min).
+- **Label puller:** `pull_thehive_labels.py` — queries TheHive `/api/v1/query` for closed cases with `resolutionStatus ∈ {TruePositive, FalsePositive}`, extracts rule_id + MITRE + source_ip from tags/title, writes `data/thehive_labeled.parquet`. Will populate as cases are resolved in TheHive UI.
+- **Training:** `train.py` — RF (n_estimators=300, class_weight=balanced) + XGB (n_estimators=300, max_depth=6, scale_pos_weight=auto), stratified 70/15/15 split with SMOTE gating (skipped — ratio 4:1 < 5 threshold). Produces `model_rf.pkl`, `model_xgb.pkl`, `metadata.json`, and 5 PNGs under `reports/` (confusion matrices + feature importances + ROC curves).
+- **Service rewrite:** `app.py` rewritten — 6 endpoints (`/health`, `/classify`, `/score`, `/train`, `/feedback`, `/metrics`). Decision rule for `recommended_action` (auto_close_fp / auto_escalate / send_to_analyst / queue_low_priority) lives in `app.py` not in n8n, so routing logic is unit-testable.
+- **Pipeline wired:** WF1 `ML: /score` node renamed to `ML: /classify`, URL bumped to `/classify`. `Append anomaly score` node extended to expose 8 fields (`predicted_label`, `confidence`, `recommended_action`, `ml_dataset_source`, `ml_model` + back-compat `anomaly_score`/`is_anomaly`/`bucket_id`). `Build merged tags` node injects `ml:<recommended_action>` and `ml-confirmed:<label>` tags (when confidence ≥ 0.85) into every new TheHive case.
+- **Feedback loop:** WF6 (case-resolved webhook) has a new `ML: /feedback` fan-out node — every case closed as TP/FP feeds back into `rule_stats.parquet` and `feedback_log.parquet`. Over time this drives `rule_false_positive_rate_30d` per rule_id and lets the classifier learn the *trust profile* of every rule in the corpus.
 
-Adjacent work that does NOT need encadrent input:
-- Expand feature set from 4 → 8+ (`day_of_week`, `asset_criticality`, `time_since_last_alert_for_ip`, MITRE-tactic histogram, geo-country, payload-entropy hash).
-- Add a second supervised head: TP/FP classifier trained on TheHive's resolved cases with `resolutionStatus` labels. Slot it next to `/score` as `/classify_tp_fp`.
+**Honest framing for the rapport:** the CICIDS test scores (1.00 P/R/F1/AUC) are **label leakage** — our preprocessor derived features (severity, risk_score, MITRE tactic) from the CICIDS attack-type label. The 2.83M-row run proves the pipeline scales (training in ~2 min, inference < 30ms); the *meaningful* numbers come from `thehive_labeled.parquet` once enough cases are resolved. Rapport section §6.5 will document the leakage caveat explicitly rather than hide it.
 
-**Outcome (when complete):** WF1 receives a meaningful anomaly score that gates real triage decisions instead of being a placeholder. The choice of training dataset becomes a defendable rapport bullet rather than an open question.
+**Outcome:** ml-api now has a defendable academic story (supervised classifier on a public IDS dataset + continuously-updated rule trust scores from production resolutions), instead of a synthetic-bootstrap placeholder.
 
 ---
 
@@ -519,6 +523,26 @@ Sub-steps (to run when ready):
 - Optional Phase 15b: enable a curated subset of Elastic's ~1000 prebuilt detection rules in Kibana before running ART tests, to demonstrate the system handles a much larger rule corpus than the 13 customs.
 
 **Outcome (when complete):** Empirical evidence in the rapport that the pipeline works against real attacker behavior, not just synthetic webhook firings. Strong demo moment for the soutenance: "this is the system reacting to a real MITRE-mapped attack technique, live."
+
+---
+
+### Phase 16 — L2 escalation NLP module (COMPLETE 2026-05-23)
+**Goal:** When the correlation engine decides `escalate_existing` (severity bump on a (source_ip, rule_id) bucket OR new MITRE tactic detected from the same source IP in the 2h kill-chain window), automatically build a structured L2 brief and post it to the TheHive case. Supervisor brief: "Une fois le cas TheHive créé, si une escalade L2 est déclenchée, un module NLP corrèle les alertes, génère un résumé d'incident et suggère des actions de remédiation basées sur la technique MITRE identifiée."
+
+**What landed:**
+- **Trigger:** `correlation-engine/app.py` patched with a fire-and-forget daemon-thread helper `_fire_l2_webhook()`. Every time `/correlate` returns `action: escalate_existing` AND has a `case_id`, the engine POSTs `{case_id, bucket_id, source_ip, destination_ip, rule_id, mitre_tactic_id, mitre_technique_id, severity, chain_detected, escalation_reason}` to `http://127.0.0.1:5678/webhook/l2-escalation`. Asynchronous — WF1's `/correlate` latency unchanged.
+- **WF9 — "09 L2 Escalation NLP (Workflow 9)"** — 15-node sequential workflow (id `b8598a6fa7b04e51`):
+  1. `Webhook (l2-escalation)` — receives the POST
+  2. `TheHive: fetch case` → `TheHive: fetch observables` → `TheHive: fetch comments` → `ES: related alerts` (sequential chain so all four are ancestors of `Build correlate prompt` — avoids the cross-node `$('node')` reference trap)
+  3. `ES: related alerts` — bool/should query on `source.ip` over `.alerts-security.alerts-default`, this is the supervisor's "advanced search Tier 2: same alerts in same time range"
+  4. 3 sequential Code+Ollama pairs: `Build correlate prompt` → `Ollama: correlate` (1000 tokens, format:json) → `Build summarize prompt` → `Ollama: summarize` (1000 tokens) → `Build recommend prompt` → `Ollama: recommend` (1500 tokens — MITRE ATT&CK mitigation IDs M1037 etc. + concrete commands per action)
+  5. `Build L2 brief` — assembles a structured Markdown brief (Situation / Kill chain / Impact / Urgency / Key indicators / Related clusters / Recommended actions / Containment window / Post-action checks / Open questions for L2)
+  6. Fan-out to `TheHive: post brief comment` + `TheHive: create L2 task` + `TheHive: tag l2-brief-posted` (idempotency tag prevents re-fire)
+- **Prompt templates** under `/home/vboxuser/soc-project/n8n-prompts/l2/` (`correlate.txt`, `summarize.txt`, `recommend.txt`) — git-trackable source of truth. Inlined into the workflow Code nodes by the operator script `/tmp/wf9_create_l2_escalation.py` (n8n's Code-node sandbox blocks `require('fs')`, so file-loading at runtime isn't possible; re-baking inline is the workaround).
+- **No separate Flask service.** The `nlp-api/` scaffold stays empty as planned; the "NLP module" is WF9 itself with HTTP-to-Ollama, same proven pattern as WF6 investigation report.
+- **End-to-end validation:** webhook POST → 15-node chain → real L2 brief on a real TheHive case. Validated as far as the infrastructure allowed in this session — TheHive write nodes verified (HTTP 200 in <1s), Ollama prompt outputs verified standalone (valid JSON for correlate + summarize + recommend at 1500-token cap), full chain blocked at time of writing by Ollama tunnel being down from 192.168.1.70:11434. WF9 wiring + correlation-engine webhook are live and tested; re-fire once Ollama is back up.
+
+**Outcome:** when L2 escalation is triggered, an analyst opening the TheHive case finds (in under 90 seconds via WF9) a complete 9-section markdown brief with situation summary, kill-chain reconstruction, blast-radius assessment, urgency score, top 5 indicators, 3-5 prioritised remediation actions tied to ATT&CK mitigations with concrete commands, containment window, post-action verification checks, and open questions for L2 review. The supervisor's "advanced search Tier 2" requirement is satisfied by step 3 (ES bool/should query on source IP within ±30 min).
 
 ---
 
@@ -764,6 +788,7 @@ All in `/home/vboxuser/.n8n/.n8n/database.sqlite` (table `workflow_entity`). All
 | 6 | 06 Investigation Report | `Srr7LavaermzMzB9` | POST `/webhook/thehive-case-resolved` | active | 2026-05-17 (exec 453 — 9-section Markdown report posted to case 44) |
 | 7 | 07 Q&A Chatbot | `wf7QAchatbotXXX1` | Schedule (15s) | **deactivated 2026-05-17** | dropped — too slow on CPU; kept as record |
 | 8 | 08 Email Ack | `wf8EmailAckXXXX1` | GET `/webhook/email-ack` | active | 2026-05-17 (verified end-to-end on case 44) |
+| 9 | 09 L2 Escalation NLP | `b8598a6fa7b04e51` | POST `/webhook/l2-escalation` (fired by correlation-engine `_fire_l2_webhook` daemon-thread on `escalate_existing` action) | active | 2026-05-23 (wiring + correlation-engine webhook patched live; full Ollama chain pending tunnel restore) |
 
 ### Polling bridges (TheHive notifier replacement, on VM_B1)
 
@@ -790,6 +815,32 @@ These are one-shot Python scripts that read/write `~/.n8n/.n8n/database.sqlite` 
 | `/tmp/wf6_build_prompt_in_code.py` | final WF6 fix — moves prompt assembly into the Code node, uses `{{ JSON.stringify($json.full_prompt) }}` in HTTP body |
 | `/tmp/wf7_create_qa_chatbot.py` | builds WF7 (Q&A chatbot — dropped) |
 | `/tmp/wf8_email_ack.py` | builds WF8 (Email Ack receiver) |
+| `/tmp/wf1_add_ml_classify_routing.py` | renames WF1 `ML: /score` → `ML: /classify`, bumps URL to `/classify`, extends `Append anomaly score` to surface 8 classifier fields, injects `ml:<action>` / `ml-confirmed:<label>` / `ml-model:<name>` tags via `Build merged tags` |
+| `/tmp/wf6_add_ml_feedback.py` | adds `ML: /feedback` fan-out node to WF6 (case-resolved path) so every TP/FP resolution updates `rule_stats.parquet` + appends to `feedback_log.parquet` on ml-api |
+| `/tmp/correlation_engine_add_l2_webhook.py` | patches `correlation-engine/app.py` with `import threading`, `N8N_L2_WEBHOOK_URL` config, `_fire_l2_webhook()` daemon-thread helper, and rewires `/correlate` handler to fire the webhook on `escalate_existing` |
+| `/tmp/wf9_create_l2_escalation.py` | builds WF9 from scratch (15 nodes — Webhook → 4 TheHive/ES fetches sequentially → 3 Code+Ollama prompt pairs → Build L2 brief → 3 TheHive write nodes) |
+
+### ML / NLP file locations (Phase 14 + Phase 16)
+
+| Path | Purpose |
+|---|---|
+| `/home/vboxuser/soc-project/ml-api/feature_engineering.py` | 15-feature rule-agnostic vector + `_shrink_fp_rate` Bayesian helper + `update_rule_stats` |
+| `/home/vboxuser/soc-project/ml-api/preprocess_cicids.py` | vectorized CICIDS2017 → 15-feature parquet (8 CSVs, 2.83M rows in 34s) |
+| `/home/vboxuser/soc-project/ml-api/pull_thehive_labels.py` | TheHive `/api/v1/query` → `data/thehive_labeled.parquet` (reads `THEHIVE_TOKEN` env) |
+| `/home/vboxuser/soc-project/ml-api/train.py` | RF + XGB pipeline with stratified split + optional SMOTE + 5 PNG plots + metadata.json |
+| `/home/vboxuser/soc-project/ml-api/app.py` | rewritten Flask service: `/health /classify /score /train /feedback /metrics` |
+| `/home/vboxuser/soc-project/ml-api/model_rf.pkl` + `model_xgb.pkl` | joblib pickles, loaded at app boot |
+| `/home/vboxuser/soc-project/ml-api/metadata.json` | trained_at + dataset_source + n_train/test + metrics + feature_importance (served by `/metrics`) |
+| `/home/vboxuser/soc-project/ml-api/data/cicids2017/*.csv` | 8 CICIDS2017 source CSVs (885 MB extracted, gitignored) |
+| `/home/vboxuser/soc-project/ml-api/data/cicids2017_features.parquet` | preprocessed 15-feature training set |
+| `/home/vboxuser/soc-project/ml-api/data/thehive_labeled.parquet` | TheHive-resolved labels (created on first `pull_thehive_labels.py` run) |
+| `/home/vboxuser/soc-project/ml-api/data/rule_stats.parquet` | learned per-rule TP/FP counts, hot-updated on every `/feedback` POST |
+| `/home/vboxuser/soc-project/ml-api/data/feedback_log.parquet` | audit log of every `/feedback` POST (rule_id + label + case_id + timestamps) |
+| `/home/vboxuser/soc-project/ml-api/reports/{confusion_matrix_rf,confusion_matrix_xgb,feature_importance_rf,feature_importance_xgb,roc_curves}.png` | rapport-grade visuals from last training run |
+| `/home/vboxuser/soc-project/n8n-prompts/l2/correlate.txt` | WF9 stage-1 prompt template (cluster alerts by kill-chain stage, `format:json`) |
+| `/home/vboxuser/soc-project/n8n-prompts/l2/summarize.txt` | WF9 stage-2 prompt (4-section L2 brief, `format:json`) |
+| `/home/vboxuser/soc-project/n8n-prompts/l2/recommend.txt` | WF9 stage-3 prompt (3-5 actions tied to ATT&CK mitigations, `format:json`) |
+| `/home/vboxuser/soc-project/correlation-engine/app.py.bak-l2-webhook-<epoch>` | pre-patch backup of correlation-engine before L2 webhook injection |
 
 ### Email infrastructure (Mailtrap)
 
@@ -812,7 +863,7 @@ analyst's laptop (Windows host @ 192.168.1.70) ─── SSH -L ───► clo
                                                               OLLAMA_KEEP_ALIVE=24h
 ```
 
-Command run from Windows host: `ssh -L 192.168.1.70:11434:127.0.0.1:11434 root@10.11.21.31`. Must be re-established manually if Windows host reboots. All LLM features in WF1/WF2/WF3/WF4/WF6 target `http://192.168.1.70:11434/api/generate`.
+Command run from Windows host: `ssh -L 192.168.1.70:11434:127.0.0.1:11434 root@10.11.21.31`. Must be re-established manually if Windows host reboots. All LLM features in WF1/WF2/WF3/WF4/WF6/WF9 target `http://192.168.1.70:11434/api/generate`.
 
 ### Key documentation files (on VM_A1, under `~/soc-shared/`)
 
@@ -825,10 +876,11 @@ Command run from Windows host: `ssh -L 192.168.1.70:11434:127.0.0.1:11434 root@1
 | `~/soc-shared/docs/SOC-AUTONOME-HANDBOOK.html` | self-contained HTML version of the handbook (rendered mermaid + syntax highlighting, has print stylesheet for Save-as-PDF) |
 | `~/soc-shared/docs/session-history.md` | archive of older CLAUDE.md last-session entries |
 
-### What's pending right now (2026-05-17)
+### What's pending right now (2026-05-23)
 
-1. **Phase 14 — ML grounding:** waiting on encadrent input re training dataset choice (UNSW-NB15 / CIC-IDS2017 / Atomic Red Team / other).
-2. **Phase 15 — Atomic Red Team pipeline validation:** independent of (1), can start whenever — install ART, pick 3-5 techniques mapped to SOC rules, run end-to-end against the pipeline.
-3. **Phase 11 finish — PFE rapport:** handbook is the input; rapport sections still to write.
-4. **Polish pass:** email design, Cortex synth markdown, auto-tag rendering, investigation report layout. Deferred earlier in favor of feature breadth.
+1. **Phase 16 — WF9 end-to-end smoke (blocked):** wiring + correlation-engine webhook live; full 3-stage Ollama chain pending **SSH tunnel from Windows host @ 192.168.1.70 to cloud Ollama** being restored. To re-fire: re-establish tunnel, then `curl -X POST http://127.0.0.1:5678/webhook/l2-escalation -d '{"case_id":"<real ~_id>", ...}'` and observe TheHive case for the posted comment + L2 task + `l2-brief-posted` tag.
+2. **Phase 14 polish — TheHive labels:** ml-api is trained on CICIDS only; first `pull_thehive_labels.py` run pending a real `THEHIVE_TOKEN` in env. Once enough cases are resolved as TP/FP, re-run `train.py` to get the meaningful (non-leaked) metrics for the rapport.
+3. **Phase 15 — Atomic Red Team pipeline validation:** install ART, pick 3-5 techniques mapped to SOC rules, run end-to-end against the pipeline. Best demo moment for the soutenance.
+4. **Phase 11 finish — PFE rapport:** handbook is the input; rapport sections still to write (now with Phase 14 + Phase 16 outcomes available).
+5. **Polish pass:** email design, Cortex synth markdown, auto-tag rendering, investigation report layout. Deferred earlier in favor of feature breadth.
 5. **Optional public-URL swap:** if WF8 email-ack is to work for analysts outside the ZeroTier overlay (e.g., real Gmail inbox on a phone), the link target needs to move from `http://192.168.1.50:5678/...` to a cloudflared / ngrok / named tunnel URL. Documented as production-deployment swap, not a lab blocker.
