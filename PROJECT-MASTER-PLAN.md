@@ -544,6 +544,70 @@ Sub-steps (to run when ready):
 
 **Outcome:** when L2 escalation is triggered, an analyst opening the TheHive case finds (in under 90 seconds via WF9) a complete 9-section markdown brief with situation summary, kill-chain reconstruction, blast-radius assessment, urgency score, top 5 indicators, 3-5 prioritised remediation actions tied to ATT&CK mitigations with concrete commands, containment window, post-action verification checks, and open questions for L2 review. The supervisor's "advanced search Tier 2" requirement is satisfied by step 3 (ES bool/should query on source IP within ±30 min).
 
+### Phase 18 — Engine retirement + rule-agnostic Elastic-native architecture (COMPLETE 2026-05-26)
+**Goal:** simplify the SOAR by retiring the standalone correlation engine, replacing burst dedupe with TheHive-side lookup, and moving chain detection from in-memory buckets to Elasticsearch deep search at case-creation time. Everything must work uniformly across all three rule sources: 13 custom SOC rules, ~1500 Elastic prebuilt rules, and Suricata signatures (via a new catch-all detection rule).
+
+**Architectural pivot — why retire the engine:**
+The correlation engine on `:5002` (Flask + SQLite, 30-min bucket / 2h kill-chain windows) duplicated state that Elastic already holds. Its three jobs all moved to better homes:
+
+| Engine job (pre-P18) | P18 replacement | Why better |
+|---|---|---|
+| Burst dedupe (same `(rule_id, source_ip)` within 30 min → 1 case) | TheHive `listCase` lookup by canonical `dedupe:<key>` tag at WF1 entry | Single source of truth (TheHive holds open cases anyway), no orphan-bucket race when `case_id` is set asynchronously |
+| Chain detection (different rules, same source IP, within 2h, crossing MITRE tactics) | WF9 deep-search ES query covering 30+ ECS dimensions at case-creation time | Wider lookback (up to 7 days), more dimensions than just `source.ip + tactic`, no separate state |
+| `escalate_existing` trigger of WF9 | WF1 unconditionally fires WF9 on every High/Critical case-create | Removes engine as critical path; WF9 always has the chain context it needs |
+
+**What changed — n8n side (operator scripts in `/tmp/wf1_p18_*.py` and `/tmp/wf9_p18_*.py`):**
+- **P18.1** — `Build canonical payload` rewritten from a `Set` node to a 145-line `Code` node that detects rule_source (`custom_soc`/`elastic_prebuilt`/`suricata`/`other`), extracts 16 normalized fields per source (including new ones: `rule_source`, `destination_ip`, `host_name`, `user_name`, `dedupe_key`), and works uniformly across all three rule sources. Suricata's `event.severity` priority (1–4) maps to `critical`/`high`/`medium`/`low` on its own branch.
+- **P18.4** — 7 new nodes inserted between `Build canonical payload` and `ML: /classify`:
+  - `IF severity gate` — short-circuits Low/Medium to `End: skipped (low/medium)` (with reason "not actionable in real-time SOC; alert remains visible in Elastic for retrospective hunting"). Defense-in-depth alongside any source-side filter.
+  - `TheHive: dedupe lookup` — POST `/api/v1/query` with `listCase` filter on `tags ⊇ [dedupe:<canonical_key>]` AND `status=InProgress`.
+  - `Parse dedupe result` — Code node enforces 5-min freshness window (defense against stale tag matches), returns `{found, found_case_id, found_case_number}`.
+  - `IF dedupe found` → `TheHive: append observable (dedupe)` (adds source_ip observable with "deduped" tag + merge comment) → `End: deduped (added to existing case)`.
+  - On `not found` → continues into the existing ML → Ollama → TheHive case-create chain.
+  - `TheHive: create case` patched to add `dedupe:{{ dedupe_key }}` to tags so future fires find it.
+  - `Append anomaly score` patched: dangling `$('Correlation Engine: /correlate').item.json.bucket_id` reference → literal `0`.
+- **P18.5** — `WF9: trigger L2 escalation` HTTP node added as a parallel successor of `TheHive: create case`; POSTs the full canonical payload + case_id to `http://192.168.1.50:5678/webhook/l2-escalation`. Replaces the engine's `escalate_existing` callback. Fire-and-forget (5s timeout, `neverError: true`).
+- **P18.6a** — 7 nodes removed from WF1 (Correlation Engine `/correlate`, Switch by action, End: suppressed, End: queued for digest, TheHive: add to existing case [engine path], TheHive: escalate existing case, Correlation Engine: set_case). Two direct edges spliced: `Build canonical payload → ML: /classify` (effectively, via the dedupe chain now), and `TheHive: add source_ip observable → IF auto_block?`.
+- **P18.7** — WF9's `ES: related alerts` query body rewritten from a single 5-field source.ip term query into a 3,592-char tiered bool query covering **30+ ECS dimensions** across 4 tiers, excluding the current alert by `first_signal_id`:
+  - **T1 — Identity overlap** (±30 min): `source.ip`, `destination.ip`, `related.ip`, `host.name`, `user.name`
+  - **T2 — Behavioral fingerprint** (±2 h): `process.hash.sha256`, `file.hash.sha256`, `network.community_id`, `tls.client.ja3` (any-of) AND `source.ip`/`host.name` overlap
+  - **T3 — Infrastructure** (±24 h): `source.as.organization.name`
+  - **T4 — Tactic family** (±7 d): nested query on `kibana.alert.rule.threat.tactic.id`, excluding the same source.ip (so cross-actor hits surface)
+  - Returns rich `_source` list (45 fields) including Suricata-specific (`suricata.eve.alert.*`), TLS fingerprints, process tree, file hashes — feeds the Ollama L2 brief with the chain context it now needs to reconstruct kill chains on its own.
+
+**What changed — Elastic / infrastructure side:**
+- **P18.2** — New Kibana detection rule `SOC: Suricata alert (catch-all)` (`rule_id: soc-suricata-catchall-v1`) watching `logs-suricata.eve-*` with KQL `event.dataset:"suricata.eve" and suricata.eve.event_type:"alert"`. Severity mapping derived from `suricata.eve.alert.severity` priority. Action body templates `SURI-{signature_id}` as the canonical rule_id and posts to the same n8n webhook connector — Suricata alerts now flow through WF1 with the exact same canonical payload + dedupe + L2 escalation as custom SOC + Elastic prebuilt rules. **Rule-agnostic by construction.**
+- **P18.3 — deferred (superseded):** the n8n-side `IF severity gate` (P18.4) handles severity filtering uniformly across all rule sources without per-rule Kibana action filters. Per-rule alerts_filter would be defense-in-depth, not blocking; documented as optional future work.
+- **P18.6b** — `correlation-engine.service` stopped + disabled in systemd. `/opt/correlation-engine` symlink renamed to `/opt/correlation-engine.retired-2026-05-26`. WF3 (Daily Digest, id `Z1VpjJlhg2Skek1B`) deactivated in n8n DB (`active=0`) — daily-digest queue is gone with the engine; low-severity context now lives in Elastic. n8n service restarted to load all P18 workflow changes.
+
+**Architecture in one diagram (post-P18):**
+```
+Elastic Detection Rules (custom SOC / Elastic prebuilt / Suricata catch-all)
+    │
+    ▼   webhook POST /webhook/elastic-alert
+WF1 — 01 Alert Pipeline
+    ├── Build canonical payload (rule-agnostic, 16 fields + dedupe_key)
+    ├── IF severity gate → End: skipped (low/medium)
+    ├── TheHive: dedupe lookup → IF found:
+    │       True  → TheHive: append observable → End: deduped
+    │       False ↓
+    ├── ML /classify → Ollama email (HTML render) → TheHive: create case
+    └── Parallel: WF9: trigger L2 escalation (fire-and-forget)
+            │
+            ▼
+WF9 — 09 L2 Escalation NLP
+    ├── ES deep search (4-tier, 30+ ECS dims, ±30m → ±7d)
+    ├── TheHive: fetch case + observables + comments
+    └── Ollama correlate → summarize → recommend → post L2 brief
+```
+
+**Trade-offs (explicit for the rapport):**
+- **Low-only kill chains go undetected.** A chain that is recon (low) → execution (low) → priv-esc (low) — all severity ≤ medium — never triggers a case in this architecture. Acceptable: an L1 SOC's job is to surface actionable signals; low-only chains stay queryable in Elastic for retrospective hunting but don't wake anyone up.
+- **Burst dedupe latency** of ~80–200 ms per alert (one TheHive query) replaces the engine's ~10 ms in-memory bucket lookup. Worth it for the single-source-of-truth simplification.
+- **Suricata canonical_id is `SURI-<signature_id>`** — not yet mapped to a human-readable signature name in the dedupe key. Sufficient for dedupe; the readable signature name lives in `rule_name` for display.
+
+**Outcome:** the SOAR is one fewer service (correlation engine retired), one fewer workflow (WF3 daily digest retired, 8 workflows now), and rule-agnostic by design — `Build canonical payload` is the source-detection layer, TheHive is the dedupe store, Elastic via the WF9 deep-search is the chain detector. Cross-source kill chains (e.g., Suricata exploit attempt → Elastic prebuilt initial-access → custom SOC priv-esc) now surface uniformly in the L2 brief. Pending end-to-end validation: blocked at time of writing on the Ollama tunnel being down; smoke-tested as far as the chain reached (workflow accepted webhook, exec finished, ML node fell through to defaults — dedupe and WF9 trigger paths verified structurally).
+
 ---
 
 ## 10. Integration Map — Service-to-Service Connections
@@ -750,7 +814,7 @@ If a sub-step fails or behaves unexpectedly:
 
 ---
 
-## 16. Current state snapshot (as of 2026-05-17)
+## 16. Current state snapshot (as of 2026-05-26)
 
 ### Service status — VM_A1 (192.168.1.50)
 
@@ -764,7 +828,7 @@ If a sub-step fails or behaves unexpectedly:
 | Ollama (local) | ❌ uninstalled 2026-05-15 | n/a | moved to cloud VM `10.11.21.31`, reached via SSH tunnel on `192.168.1.70:11434` |
 | ML API (Isolation Forest) | ✅ running | `/home/vboxuser/soc-project/ml-api/app.py` · model `/home/vboxuser/soc-project/ml-api/model.pkl` · venv `/home/vboxuser/soc-project/ml-api/venv/` · symlink `/opt/ml-api/` | port 5000, `source: "synthetic"` |
 | NLP API | ❌ scaffold only | folder `/home/vboxuser/soc-project/nlp-api/` exists with empty venv + `prompts/` subdir | intentionally not built — n8n+Ollama replaces it |
-| Correlation Engine | ✅ running | `/home/vboxuser/soc-project/correlation-engine/app.py` · state DB `/opt/correlation-engine/state.db` · symlink `/opt/correlation-engine/` | port 5002 |
+| Correlation Engine | ❌ **retired 2026-05-26 (Phase 18)** | systemd unit stopped + disabled; symlink renamed `/opt/correlation-engine.retired-2026-05-26`; code preserved at `/home/vboxuser/soc-project/correlation-engine/` for rollback | replaced by TheHive-side dedupe + WF9 ES deep-search |
 
 ### Service status — VM_B1 (192.168.1.51)
 
@@ -782,13 +846,14 @@ All in `/home/vboxuser/.n8n/.n8n/database.sqlite` (table `workflow_entity`). All
 |---|---|---|---|---|---|
 | 1 | 01 Alert Pipeline | `dKSF2AU9E3k9i25p` | POST `/webhook/elastic-alert` | active | Phase 10 (2026-05-10) + WF1 patches through 2026-05-17 |
 | 2 | 02 Cortex Enrichment | `HYiSFNStG5zEG6ZA` | POST `/webhook/thehive` (polling bridge) | active | 2026-05-15 (Cortex synthesis added) |
-| 3 | 03 Daily Digest | `Z1VpjJlhg2Skek1B` | cron 08:00 Africa/Tunis | active | 2026-05-15 (narrative + cloud Ollama) |
+| 3 | 03 Daily Digest | `Z1VpjJlhg2Skek1B` | cron 08:00 Africa/Tunis | **deactivated 2026-05-26 (Phase 18)** | retired with the correlation engine — low-severity context now lives in Elastic, not in a separate digest queue |
 | 4 | 04 MISP → AI Rule Gen | `SbXmkucPC24njKwb` | POST `/webhook/misp` (polling bridge) | active | known limitation: Ollama 10-min timeout vs CPU latency |
 | 5 | 05 Weekly Maintenance | `ekXEZb2PYaxQt7vv` | cron Mon 04:00 | active | depends on real alert volume to do meaningful work |
 | 6 | 06 Investigation Report | `Srr7LavaermzMzB9` | POST `/webhook/thehive-case-resolved` | active | 2026-05-17 (exec 453 — 9-section Markdown report posted to case 44) |
 | 7 | 07 Q&A Chatbot | `wf7QAchatbotXXX1` | Schedule (15s) | **deactivated 2026-05-17** | dropped — too slow on CPU; kept as record |
 | 8 | 08 Email Ack | `wf8EmailAckXXXX1` | GET `/webhook/email-ack` | active | 2026-05-17 (verified end-to-end on case 44) |
-| 9 | 09 L2 Escalation NLP | `b8598a6fa7b04e51` | POST `/webhook/l2-escalation` (fired by correlation-engine `_fire_l2_webhook` daemon-thread on `escalate_existing` action) | active | 2026-05-23 (wiring + correlation-engine webhook patched live; full Ollama chain pending tunnel restore) |
+| 9 | 09 L2 Escalation NLP | `b8598a6fa7b04e51` | POST `/webhook/l2-escalation` (now fired unconditionally by WF1's `WF9: trigger L2 escalation` parallel node on every High/Critical case-create — was correlation-engine; engine retired 2026-05-26) | active | 2026-05-26 (ES query rewritten as 4-tier 30+ ECS-dim bool search; full Ollama chain pending tunnel restore) |
+| 10 | 10 L2 Verdict | `wf10L2VerdictXX` | GET `/webhook/l2-verdict?case_id=X&verdict=tp\|fp&l2_user=email` | active (live; smoke-test pending B1 reachability) | 2026-05-26 (Phase 19.1) — TP/FP click closes case + ml-api /feedback + amber/navy HTML confirmation page |
 
 ### Polling bridges (TheHive notifier replacement, on VM_B1)
 
@@ -819,6 +884,13 @@ These are one-shot Python scripts that read/write `~/.n8n/.n8n/database.sqlite` 
 | `/tmp/wf6_add_ml_feedback.py` | adds `ML: /feedback` fan-out node to WF6 (case-resolved path) so every TP/FP resolution updates `rule_stats.parquet` + appends to `feedback_log.parquet` on ml-api |
 | `/tmp/correlation_engine_add_l2_webhook.py` | patches `correlation-engine/app.py` with `import threading`, `N8N_L2_WEBHOOK_URL` config, `_fire_l2_webhook()` daemon-thread helper, and rewires `/correlate` handler to fire the webhook on `escalate_existing` |
 | `/tmp/wf9_create_l2_escalation.py` | builds WF9 from scratch (15 nodes — Webhook → 4 TheHive/ES fetches sequentially → 3 Code+Ollama prompt pairs → Build L2 brief → 3 TheHive write nodes) |
+| `/tmp/wf1_wire_html_email.py` | wires `alert.compiled.js` HTML render into WF1 — inserts `Build email HTML` Code node between `Ollama: write alert email` and `IF env (test/prod)`; rewrites Ollama prompt to return JSON with 8 fields; patches both SMTP nodes to `emailFormat: "html"` |
+| `/tmp/wf1_p18_1_canonical.py` | **Phase 18.1** — rewrites `Build canonical payload` from Set node to rule-agnostic Code node (16 fields incl. `rule_source` / `destination_ip` / `host_name` / `user_name` / `dedupe_key`) covering custom SOC + Elastic prebuilt + Suricata |
+| `/tmp/wf1_p18_4_dedupe.py` | **Phase 18.4** — inserts severity gate + TheHive `listCase` dedupe lookup + IF-found branch (append observable to existing case vs continue to ML) before `ML: /classify`; appends `dedupe:<key>` tag to case create body; fixes dangling `bucket_id` reference |
+| `/tmp/wf1_p18_5_wf9_trigger.py` | **Phase 18.5** — adds `WF9: trigger L2 escalation` HTTP node as parallel successor of `TheHive: create case`, replacing engine's `escalate_existing` callback |
+| `/tmp/wf1_p18_6a_remove_engine.py` | **Phase 18.6a** — removes 7 correlation-engine nodes from WF1 (Correlate, Switch by action, suppressed/queued end nodes, engine-driven add/escalate, set_case) and splices direct edges |
+| `/tmp/wf9_p18_7_deep_search.py` | **Phase 18.7** — rewrites WF9 `ES: related alerts` query into 4-tier 30+ ECS-dim bool query (Identity ±30m, Behavioral fingerprint ±2h, Infrastructure ±24h, Tactic family ±7d) excluding current alert by `first_signal_id` |
+| `/tmp/wf10_create_l2_verdict.py` | **Phase 19.1** — builds WF10 from scratch (9 nodes — GET webhook → Parse params → fetch case → Build patch body → PATCH /case (status=Resolved + resolutionStatus + tags + summary) → POST verdict comment → POST ml-api /feedback → HTML response page) |
 
 ### ML / NLP file locations (Phase 14 + Phase 16)
 
@@ -876,11 +948,41 @@ Command run from Windows host: `ssh -L 192.168.1.70:11434:127.0.0.1:11434 root@1
 | `~/soc-shared/docs/SOC-AUTONOME-HANDBOOK.html` | self-contained HTML version of the handbook (rendered mermaid + syntax highlighting, has print stylesheet for Save-as-PDF) |
 | `~/soc-shared/docs/session-history.md` | archive of older CLAUDE.md last-session entries |
 
-### What's pending right now (2026-05-23)
+### What's pending right now (2026-05-26)
 
-1. **Phase 16 — WF9 end-to-end smoke (blocked):** wiring + correlation-engine webhook live; full 3-stage Ollama chain pending **SSH tunnel from Windows host @ 192.168.1.70 to cloud Ollama** being restored. To re-fire: re-establish tunnel, then `curl -X POST http://127.0.0.1:5678/webhook/l2-escalation -d '{"case_id":"<real ~_id>", ...}'` and observe TheHive case for the posted comment + L2 task + `l2-brief-posted` tag.
-2. **Phase 14 polish — TheHive labels:** ml-api is trained on CICIDS only; first `pull_thehive_labels.py` run pending a real `THEHIVE_TOKEN` in env. Once enough cases are resolved as TP/FP, re-run `train.py` to get the meaningful (non-leaked) metrics for the rapport.
-3. **Phase 15 — Atomic Red Team pipeline validation:** install ART, pick 3-5 techniques mapped to SOC rules, run end-to-end against the pipeline. Best demo moment for the soutenance.
-4. **Phase 11 finish — PFE rapport:** handbook is the input; rapport sections still to write (now with Phase 14 + Phase 16 outcomes available).
-5. **Polish pass:** email design, Cortex synth markdown, auto-tag rendering, investigation report layout. Deferred earlier in favor of feature breadth.
-5. **Optional public-URL swap:** if WF8 email-ack is to work for analysts outside the ZeroTier overlay (e.g., real Gmail inbox on a phone), the link target needs to move from `http://192.168.1.50:5678/...` to a cloudflared / ngrok / named tunnel URL. Documented as production-deployment swap, not a lab blocker.
+**Active blockers — both infrastructure-side, not code-side:**
+
+1. **VM_B1 (TheHive + Cortex + MISP) unreachable** — ping fails from VM_A1, ports 9000/9001 both timeout. Blocks: WF1 dedupe lookup (TheHive), WF9 L2 brief (TheHive write), WF10 verdict (TheHive PATCH), Phase 19 build (Cortex connector status check + custom-field creation + l1/l2 user creation attempt). Owner action: bring B1 back up.
+
+2. **Cloud Ollama tunnel down** — `http://192.168.1.70:11434` not reachable. Blocks: all Ollama-dependent nodes (WF1 alert email, WF2 Cortex synth, WF3 daily digest [now retired], WF4 MISP rule gen, WF6 investigation report, WF9 L2 brief). Owner action: re-establish SSH tunnel from Windows host `ssh -L 192.168.1.70:11434:127.0.0.1:11434 root@10.11.21.31` (requires FortiClient VPN to 10.11.21.x range).
+
+**What landed today (2026-05-26):**
+
+- **Rich HTML alert email** wired into WF1 — git-versioned template at `/home/vboxuser/soc-project/n8n-prompts/email/alert.html.j2` (dark navy + amber TheHive palette, SVG shield with SMIL pulse animation, kill-chain pill grid, 8 AI-generated sections, ACK button + Kibana/TheHive deep-link buttons with base64-inlined logos). Compiled via `compile_template.py` into a self-contained `alert.compiled.js` (314 KB, no `fs`/`nunjucks` required — works inside n8n's task-runner sandbox). Patched WF1's Ollama prompt to return JSON for the 8 fields; new `Build email HTML` Code node renders before SMTP.
+- **Phase 18 — engine retirement + rule-agnostic architecture** (8 sub-steps, all complete). See §Phase 18 above for full narrative. Net effect: correlation engine + WF3 retired; WF1 + WF9 now process custom SOC + Elastic prebuilt + Suricata uniformly via canonical payload + TheHive-side dedupe + ES deep-search.
+- **Phase 19.1 — WF10 L2 Verdict webhook** live at `/webhook/l2-verdict`. Accepts TP/FP query params from L2 email clicks → PATCHes TheHive case (status=Resolved + resolutionStatus + tags + summary) + posts comment + POSTs ml-api `/feedback` + returns amber/navy confirmation page. End-to-end smoke pending B1.
+
+**Pending work (in order, once blockers clear):**
+
+1. **WF1 end-to-end HTML email smoke** — Once Ollama + B1 are back, fire a fresh High-severity alert (e.g. SOC-EMAIL-HTML-001), verify: (a) case lands in TheHive with dedupe tag, (b) rich HTML email arrives in Gmail (sender `@demomailtrap.co`) with all 8 AI sections + working ACK button + working "Open TheHive case" button, (c) WF9 fires in parallel and posts L2 brief, (d) ACK click adds `email-acked:<user>` tag.
+2. **Phase 19 build** (paused; needs decision once B1 is back):
+   - Probe TheHive↔Cortex connector status (`curl http://192.168.1.51:9000/api/v1/cortex/status`).
+   - **Scenario A** (connector live, i.e. Platinum re-trialed): build 3 Cortex Responders (`SOC_Confirm_TP`, `SOC_Confirm_FP`, `SOC_Escalate_L2`) — real buttons in TheHive case UI.
+   - **Scenario B** (connector dead, i.e. Free tier): build single TheHive Custom Field `l1_decision` (enum dropdown: `none`/`confirm_true_positive`/`confirm_false_positive`/`escalate_to_l2`) + new WF11 router that switches on the dropdown value (TheHive notification or polling-bridge triggered).
+   - Either scenario: WF11 escalate branch sends the L2 email with TP/FP buttons that link to WF10 (already built).
+   - **L1/L2 users:** create `l1@thehive.local` + `l2@thehive.local` (analyst profile) in TheHive Free — should fit the ~3 user/org limit. If license blocks, fall back to single `soc-bot` + distinguish L1/L2 work via `assignee` field + separate email distribution lists.
+3. **Phase 14 polish — TheHive labels:** ml-api still trained on CICIDS only; first `pull_thehive_labels.py` run pending a real `THEHIVE_TOKEN` in env. Once enough cases are resolved as TP/FP via WF10/WF11, re-run `train.py` to get the meaningful (non-leaked) metrics for the rapport.
+4. **Phase 15 — Atomic Red Team pipeline validation:** install ART, pick 3-5 techniques mapped to SOC rules, run end-to-end against the pipeline. Best demo moment for the soutenance.
+5. **Phase 11 finish — PFE rapport:** handbook is the input; rapport sections still to write (now with Phase 14 + Phase 16 + Phase 18 + Phase 19 outcomes available).
+6. **Optional public-URL swap:** if WF8 email-ack / WF10 L2 verdict are to work for analysts outside the ZeroTier overlay (e.g., real Gmail inbox on a phone), the link targets need to move from `http://192.168.1.50:5678/...` to a cloudflared / ngrok / named tunnel URL. Documented as production-deployment swap, not a lab blocker.
+
+### Email template artifacts (Phase 18 byproduct)
+
+| Path | Purpose |
+|---|---|
+| `/home/vboxuser/soc-project/n8n-prompts/email/alert.html.j2` | git-versioned Jinja2/Nunjucks source template (dark theme, 8 sections, SVG shield, ACK + Kibana/TheHive CTAs) |
+| `/home/vboxuser/soc-project/n8n-prompts/email/compile_template.py` | one-shot compiler: resolves `{{ var }}` / `{% for %}` / `{% if %}` at build time into pure JS template-literal syntax; base64-inlines logo PNGs as data URIs |
+| `/home/vboxuser/soc-project/n8n-prompts/email/alert.compiled.js` | auto-generated 314 KB JS module (DO NOT edit by hand); inlined into WF1's `Build email HTML` Code node by `/tmp/wf1_wire_html_email.py` |
+| `/home/vboxuser/soc-project/n8n-prompts/email/preview.html` | pre-rendered preview with placeholder data; open in browser to eyeball before patching n8n |
+| `/home/vboxuser/soc-project/n8n-prompts/email/elasticsearch-logo-png-transparent.png` + `thehive-logo.png` + `TheHive-Logotype-1.jpg` | source PNGs base64-embedded by the compiler |
+| `/home/vboxuser/soc-project/n8n-prompts/email/README.md` | template variables contract + n8n Code-node render pattern |
