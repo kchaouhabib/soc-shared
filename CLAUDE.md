@@ -764,7 +764,7 @@ phase_13_email_ack_loop:              complete       # added 2026-05-17 (commit 
 phase_14_ml_grounding:                pending        # waiting on encadrent decision re training dataset (A: UNSW-NB15/CIC-IDS2017/NSL-KDD public IDS, B: Atomic Red Team replay on lab, C: LANL Comprehensive Cyber-Security Events). Today's model `source: "synthetic"` — /score returns ~0.62 for both clearly-suspicious and clearly-normal inputs. Adjacent work (no encadrent input needed): expand features 4→8+ (day_of_week, asset_criticality, time_since_last_alert_for_ip, MITRE-tactic histogram); add /classify_tp_fp supervised head trained on TheHive resolved cases.
 phase_15_atomic_red_team:             pending        # independent of Phase 14. Run 3-5 ART tests mapped to existing SOC rules (T1021.004→SOC-012, T1059.004→SOC-006, T1078→SOC-001/002, T1190→SOC-003/004) end-to-end through the pipeline. Log time-to-case, time-to-email, auto_block fire, AI report quality. Strong soutenance demo.
 
-last_updated: 2026-05-17
+last_updated: 2026-05-27
 updated_by: incident-mgmt (VM_B1)
 ```
 
@@ -776,7 +776,66 @@ updated_by: incident-mgmt (VM_B1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
-2026-05-17 (latest) — incident-mgmt (VM_B1) — Reconciled CLAUDE.md to current state per A1's master-plan snapshot (01f5678)
+2026-05-27 (latest) — incident-mgmt (VM_B1) — Phase 19.2: 3 Cortex Responders installed (L1 TP/FP/Escalate buttons)
+  Done (Cortex side complete + verified):
+    - Created the 3 responders + JSON defs + requirements.txt under
+      ~/soc-project/thehive-cortex/cortex/Cortex-Analyzers/responders/SOC/
+      (SOC_Confirm_TP, SOC_Confirm_FP, SOC_Escalate_L2). All POST to
+      WF11 on A1 (http://192.168.1.50:5678/webhook/l1-decision).
+    - Step 4 VERIFY: /api/responderdefinition?range=all → 147 total,
+      3 SOC_ registered (dataType thehive:case, v1.0).
+    - Step 5 ENABLE: all 3 enabled in SOC-LAB org, HTTP 201. Instance IDs:
+        SOC_Confirm_TP   = 8ba1418015871e93cd929ba1c868b7b3
+        SOC_Confirm_FP   = 1a4435fa8d16141e2d0f7d31f09f354a
+        SOC_Escalate_L2  = 1c395104361ed9d091bd26fa229bc855
+    - Step 6 target case identified: ~40972464 (#31, [SOC-012] Successful
+      SSH login), status InProgress.
+
+  THREE deviations from the handoff (next instance: read these):
+    1. The Cortex-Analyzers tree is NOT bind-mounted — it is BAKED into
+       the custom soc-cortex:4.0.1-analyzers image (compose only mounts
+       ./cortex/data:/var/cortex-jobs). Dropping files on the host does
+       NOT make them visible to Cortex. Fix used: files placed in the
+       host build context (so a future image rebuild includes them) AND
+       `docker cp`'d into the running container at
+       /opt/Cortex-Analyzers/responders/SOC, then `docker restart cortex`.
+       CAVEAT: docker-cp'd files survive docker start/stop/restart but are
+       LOST on `docker rm`/compose-recreate. For permanence, either add a
+       bind mount (./cortex/Cortex-Analyzers:/opt/Cortex-Analyzers) or
+       rebuild the image from the build context (files are already there).
+    2. The enable POST config payload must contain ONLY the declared
+       configurationItem `n8n_webhook_url`. Sending the generic analyzer
+       keys (auto_extract_artifacts/check_tlp/max_tlp/check_pap/max_pap)
+       the handoff suggested returns HTTP 500
+       "UnknownAttributeError: worker.config auto_extract_artifacts"
+       because these responders' JSON declares only n8n_webhook_url.
+    3. .env.local THEHIVE_BOT_API_KEY line has an inline `# comment`, so
+       `cut -d= -f2-` captures key+comment (73 chars) → 401. Must pipe
+       through `awk '{print $1}'` to get the real 32-char key. (The
+       CORTEX_USER_API_KEY line has no comment, so it worked as-is.)
+       soc-bot key verified working: login soc-bot@thehive.local,
+       org SOC-LAB, profile analyst.
+
+  PENDING — live click test blocked on A1:
+    - A1 (192.168.1.50) is DOWN (100% ping loss, n8n :5678 = 000). The
+      responders are clickable in TheHive UI now, but a click would run
+      the script and fail at the WF11 POST (connection refused) until A1
+      is back. The end-to-end TP-tag verification (does clicking
+      SOC_Confirm_TP add l1-verdict:tp + l1-decision-by:<user>?) must be
+      done once A1/n8n is up. Did NOT fire the responder against case #31
+      unilaterally (A1 down + it's the "do it together" step).
+
+  Lab boot note (this VM): auto-start was disabled (docker.service,
+    cassandra, elasticsearch all `disabled`; 7 containers set restart=no)
+    because simultaneous boot OOM-crashes the box. Staged startup script
+    at ~/soc-project/start-soc.sh brings the stack up one service at a
+    time (Cassandra→ES→Cortex→TheHive→MISP) health-gated with 3-min
+    settles. Run `sudo bash ~/soc-project/start-soc.sh` after each boot.
+    misp-misp-core-1 was not running at end of session (its usual
+    unhealthy init); restart via `docker start misp-misp-core-1` if MISP
+    web is needed.
+
+2026-05-17 — incident-mgmt (VM_B1) — Reconciled CLAUDE.md to current state per A1's master-plan snapshot (01f5678)
   Done:
     - Pulled A1's PROJECT-MASTER-PLAN.md update (commit 01f5678,
       2026-05-17 19:24 UTC, +224 -6 lines) which snapshots the
