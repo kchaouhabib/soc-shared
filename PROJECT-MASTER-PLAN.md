@@ -608,6 +608,50 @@ WF9 — 09 L2 Escalation NLP
 
 **Outcome:** the SOAR is one fewer service (correlation engine retired), one fewer workflow (WF3 daily digest retired, 8 workflows now), and rule-agnostic by design — `Build canonical payload` is the source-detection layer, TheHive is the dedupe store, Elastic via the WF9 deep-search is the chain detector. Cross-source kill chains (e.g., Suricata exploit attempt → Elastic prebuilt initial-access → custom SOC priv-esc) now surface uniformly in the L2 brief. Pending end-to-end validation: blocked at time of writing on the Ollama tunnel being down; smoke-tested as far as the chain reached (workflow accepted webhook, exec finished, ML node fell through to defaults — dedupe and WF9 trigger paths verified structurally).
 
+### Phase 20 — L1 response surface + IoC enrichment + L2 response library (COMPLETE 2026-05-27)
+
+**Goal:** four user-driven changes on top of the rule-agnostic pipeline:
+1. **Autoblock now requires L1 confirmation** — no more fire-and-forget iptables DROP on rule trigger.
+2. **L1 case automatically carries every IoC** observable extractable from the alert (source IP, destination IP, victim host, file hash, URL — on top of the existing source_ip/hostname/rule_id).
+3. **MISP enrichment** — for each source IP IoC, check MISP; if 0 hits, add it as a new attribute under the SOC event.
+4. **Victim link in the L1 email** — clickable Kibana discover-query link straight to the target host's events.
+5. **L2 response library** — a small SSH-based action set (`ssh_autoblock`, `kill_process`, `disable_user`, `quarantine_file`, `delete_registry` stub) that the LLM picks from per case. *LLM was down at build time, so the workaround is a deterministic MITRE→action map* (`response_map.yaml`) that the same orchestrator reads when `--action=auto` is requested. When Ollama returns, the L2 workflow will call it first with case context + script catalog and only fall back to the map if Ollama doesn't return a valid action.
+
+**What changed — A1:**
+- **P20.1 + P20.6** New n8n workflow **WF12 (`12 Response Action`, id `wf12ResponseAct1`)** at webhook `/webhook/response-action`. Webhook → Parse action params → TheHive: fetch case → Resolve target params (regex over case description for IPs, username, process, file path) → Execute response_runner.py via Execute Command node → Parse runner result → POST result comment + PATCH tag `response:<action>:<status>` → Respond JSON to caller. Built via `/tmp/wf12_create_response.py`.
+- **P20.5** New on-disk library at `/home/vboxuser/soc-project/response-scripts/`:
+  - `ssh_autoblock.sh` → `iptables -I INPUT -s <ip> -j DROP` on VM_B2 over SSH (soc-response key).
+  - `kill_process.sh` → `kill -9 <pid>` or `pkill -9 -x <name>` on target host.
+  - `disable_user.sh` → `usermod -L <user>` (refuses lab control plane + protected accounts).
+  - `quarantine_file.sh` → `mv <path> /var/quarantine/<path>.<ts>` + chmod 000 (refuses system paths).
+  - `delete_registry.sh` → Windows stub (no Windows endpoint until Phase 21+).
+  - `response_runner.py` — orchestrator. Accepts `--case-id`, `--action` (or `auto`), `--technique-id`, target overrides, `--confirm`. Resolves observables from TheHive case if a token is available, builds positional args per script, executes, returns one JSON object on stdout. Without `--confirm` every script returns `{"status":"dry_run", ...}` — safe for testing.
+  - `response_map.yaml` — 20 MITRE techniques mapped to actions (`T1110 → ssh_autoblock`, `T1059.004 → kill_process`, `T1078 → disable_user`, `T1486 → quarantine_file`, `DEFAULT → ssh_autoblock`). This is the **LLM-down stand-in** — completely deterministic, easy to A/B against Ollama outputs once it's restored.
+  - All actions append to `logs/response.log` (timestamp / requester / case_id / action / status).
+  - Safety guards: scripts refuse to operate on lab control-plane IPs (192.168.1.50–53) and on protected accounts (root, soc-response, vboxuser, kali, admin).
+- **P20.1 + P20.2 + P20.3 + P20.4** Surgical WF1 patch (`/tmp/wf1_p20_patch.py`):
+  - **Autoblock branch rewired:** the existing `IF auto_block?` → `SSH: iptables block on VM_B2` → `TheHive: log auto-block` chain is disconnected. The true branch now goes to a new `TheHive: comment awaiting-L1` node ("**Action required:** L1 analyst must click the SOC_Autoblock_Isolate Cortex Responder") → `End: case created (no auto-block)`. The SSH iptables + log nodes stay in the DB but become unreachable (intentional record-keeping).
+  - **Canonical payload extended** in the existing `Build canonical payload` Code node: `victim_host` (aliases `host_name || destination_ip`), `file_hash` (sha256/sha1/md5 fallback chain), `url`, `kibana_victim_url` (Kibana discover deep-link filtered by `host.name`). `destination_ip` was already added in Phase 18.
+  - **Four new observable POST nodes** parallel after `TheHive: add source_ip observable`: destination_ip (dataType=ip), victim_host (fqdn), file_hash (hash), url (url). All tagged `phase-20` + `auto-from-wf1`, TLP=2, ioc=true.
+  - **MISP enrichment subgraph** (3 nodes) after the same fanout: `MISP: search source_ip` (POST `/attributes/restSearch` with `value=<ip>, type=ip-src`) → `MISP: decide push` (Code node sets `misp_known` boolean + `misp_tag` `misp:known`/`misp:new`) → fan-out to `MISP: add new IP` (POST `/attributes/add/1` if unknown) + `TheHive: tag misp:known/new`. Uses `$env.MISP_API_KEY` from `.env.local`; `allowUnauthorizedCerts:true`, `neverError:true`, 8s timeout — gracefully short-circuits when MISP is down (current state).
+- 5 new Cortex Responders under `/home/vboxuser/soc-project/cortex-responders/SOC/`:
+  - `SOC_Autoblock_Isolate.py/.json` — L1 confirms iptables block.
+  - `SOC_Kill_Process.py/.json`, `SOC_Disable_User.py/.json`, `SOC_Quarantine_File.py/.json`, `SOC_Delete_Registry.py/.json` — additional buttons available from any case's Responders tab.
+  - All five POST `{case_id, action, confirm:true, l1_user, source}` to WF12. Manifests carry only the `n8n_webhook_url` config item (lesson from Phase 19 — extra keys cause Cortex 500).
+- **L1 email template** (`/home/vboxuser/soc-project/n8n-prompts/email/alert.html.j2`) gained a "Victim host" row in the Evidence section that renders as a clickable Kibana discover link (`{{ kibana_victim_url }}`) when present, falling back to plain text otherwise. Recompiled via `compile_template.py` and re-injected into WF1's `wf1-build-email-html` Code node.
+- **`.env.local`** got placeholders for `MISP_URL`, `MISP_API_KEY`, `THEHIVE_URL`, `THEHIVE_TOKEN`. Empty values are tolerated everywhere (MISP node short-circuits, response_runner skips the observable lookup).
+
+**What changed — B1 (pending):**
+- The 5 new Cortex Responders need to be `docker cp`'d into the cortex container + enabled in the SOC-LAB org. Self-contained instructions in `docs/B1-CORTEX-RESPONDERS-PHASE20.md`. Mirrors the Phase 19 install path, with the same gotchas (docker-cp non-durability, single-config-item enable body, awk-strip-comments on env key extraction) called out.
+
+**Outcome:** L1 analyst opening a fresh case sees (a) all IoCs already attached as observables, (b) a "Victim host" clickable link in the email going straight to Kibana for that host's events, (c) a "## Autoblock requested" comment when the rule wanted autoblock — gating the action behind their click on `SOC_Autoblock_Isolate`. The L2 response surface is callable from the same Responders tab (4 more buttons for kill / disable / quarantine / registry). The LLM-down workaround is purely additive: the same WF12 + scripts run when Ollama comes back, with one extra HTTP-to-Ollama node prepended that requests `{action, params}` for the current case; if Ollama disagrees with the deterministic map, that becomes a measurable A/B for the rapport.
+
+**Pending validation when B1 + LLM are back:**
+1. Install the 5 responders on B1 via `docs/B1-CORTEX-RESPONDERS-PHASE20.md`.
+2. Smoke `SOC_Quarantine_File` first (lowest impact).
+3. Live-fire `SOC_Autoblock_Isolate` against a deliberate Hydra brute-force on VM_B2 and watch the iptables rule appear + case comment + tag.
+4. Once Ollama is back, prepend `Ollama: pick action` node to WF12, compare vs `response_map.yaml` choices over 20 attack-replay scenarios for the rapport metric.
+
 ---
 
 ## 10. Integration Map — Service-to-Service Connections
