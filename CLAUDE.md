@@ -764,7 +764,7 @@ phase_13_email_ack_loop:              complete       # added 2026-05-17 (commit 
 phase_14_ml_grounding:                pending        # waiting on encadrent decision re training dataset (A: UNSW-NB15/CIC-IDS2017/NSL-KDD public IDS, B: Atomic Red Team replay on lab, C: LANL Comprehensive Cyber-Security Events). Today's model `source: "synthetic"` — /score returns ~0.62 for both clearly-suspicious and clearly-normal inputs. Adjacent work (no encadrent input needed): expand features 4→8+ (day_of_week, asset_criticality, time_since_last_alert_for_ip, MITRE-tactic histogram); add /classify_tp_fp supervised head trained on TheHive resolved cases.
 phase_15_atomic_red_team:             pending        # independent of Phase 14. Run 3-5 ART tests mapped to existing SOC rules (T1021.004→SOC-012, T1059.004→SOC-006, T1078→SOC-001/002, T1190→SOC-003/004) end-to-end through the pipeline. Log time-to-case, time-to-email, auto_block fire, AI report quality. Strong soutenance demo.
 
-last_updated: 2026-05-27
+last_updated: 2026-05-28
 updated_by: incident-mgmt (VM_B1)
 ```
 
@@ -776,7 +776,96 @@ updated_by: incident-mgmt (VM_B1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
-2026-05-27 (latest) — incident-mgmt (VM_B1) — Phase 19.2: 3 Cortex Responders installed (L1 TP/FP/Escalate buttons)
+2026-05-28 (latest) — incident-mgmt (VM_B1) — Phase 19.2 click test PASSED + Phase 20: 5 new responders installed; smoke test surfaced 2 WF12 bugs on A1
+  Phase 19.2 — closed end-to-end:
+    - Click test on SOC_Confirm_TP succeeded on case #49 (~284758136).
+      Cortex job xW3DcJ4Bbzehy1sR-F7J = Success (HTTP 200 from WF11, ~3s).
+      Case received tags l1-verdict:tp + l1-decision-by:soc-bot@thehive.local.
+    - BUG FOUND + FIXED in all 3 Phase-19 scripts during the session:
+      They expected `data["object"]["_id"]` but Cortex actually passes the
+      case object DIRECTLY under `data` (no .object wrapper), so case_id
+      came out empty → "No case _id in input data" → Failure on first click.
+      Fix applied to all 3 .py files in build context AND docker-cp'd:
+        obj = data.get("object", data)   # falls back to data itself
+        l1_user = self.get_param("parameters.user", None) or
+                  obj.get("updatedBy") or obj.get("createdBy") or ...
+        # note: NO underscore prefix on updatedBy/createdBy.
+      Same fix also applied prophylactically to all 5 Phase-20 scripts
+      before they were enabled — A1 should sync this back into
+      /home/vboxuser/soc-project/cortex-responders/SOC/*.py.
+    - About `l1-decision-by:soc-bot@...`: this is the bot identity, not
+      the real analyst clicking. Reason: TheHive uses a single Cortex
+      integration API key (the bot's). To tag with the real human, each
+      analyst needs their own Cortex API key on their TheHive profile.
+
+  Phase 20 — 5 new responders installed on B1:
+    - SCP'd 10 files from A1 (pass `changeme`) into /tmp/soc-p20-responders.
+      Same bug as Phase-19 in all 5 .py — patched in-place before deploy.
+    - Files placed in build context
+      ~/soc-project/thehive-cortex/cortex/Cortex-Analyzers/responders/SOC/
+      AND docker-cp'd into the running container. docker restart cortex.
+    - Registered: /api/responderdefinition?range=all → 152 total / 8 SOC_
+      (all v1.0, baseConfig SOC, dataType thehive:case).
+    - Enabled in SOC-LAB org — 5× HTTP 201. Instance IDs:
+        SOC_Autoblock_Isolate  = 5e04c5be31e33837731daf813362a8cc
+        SOC_Kill_Process       = fe8dbd47301c892e81ba074fe5279b3c
+        SOC_Disable_User       = 9af3b107f339b23076d5c9a90552c201
+        SOC_Quarantine_File    = 5d14b0b34ce73a4cbed70a766b001c91
+        SOC_Delete_Registry    = 664fd040cfccb4914e1e4d40e2d6d96e
+
+  Phase 20 — smoke test (SOC_Quarantine_File on case ~284758136):
+    - After A1's `sudo systemctl restart n8n` AND toggling WF12 to Active
+      in the editor (restart alone was not enough — workflow needed to be
+      flipped on), /webhook/response-action started returning HTTP 200.
+    - Cortex job x23mcJ4Bbzehy1sRYV5U = Success. Body sent:
+      {"case_id":"~284758136","action":"quarantine_file","confirm":true,
+       "l1_user":"soc-bot@thehive.local","source":"cortex_responder"}
+    - WF12 returned 200 but with two CONCERNING bugs (A1 must fix):
+
+      BUG 1 — WF12 drops the `action` field
+        WF12 response body: {"action":"unknown","status":"parse_error",
+                             "case_id":"~284758136",
+                             "l1_user":"soc-bot@thehive.local"}
+        case_id and l1_user came through, but action got remapped to
+        "unknown". Reproduced with a synthetic curl probe sending
+        action=ssh_autoblock — same parse_error result. The bug is in
+        WF12's first node (Webhook → Parse) — wrong body path.
+
+      BUG 2 — WF12 PATCH case tags is DESTRUCTIVE
+        Case #49 had 12 tags before the smoke click. After WF12 ran, only
+        2 remained: response-by:soc-bot, response:unknown:parse_error.
+        Wiped tags: PFE, SOC-HTML-PROD-1, SOC-Lab, auto-created,
+        dedupe:custom_soc:..., email-acked, email-acked:kchaou.habib67,
+        misp.category="Network activity", misp.type="uri", mitre:,
+        l1-verdict:tp, l1-decision-by:soc-bot@thehive.local.
+        WF12's case-patch step is doing PUT on the tags array. Must
+        fetch existing tags first, concat, then PATCH (or use an
+        append-style TheHive operation).
+
+    - Case #49 left in its broken 2-tag state intentionally — preserved
+      as evidence for A1 to debug WF12 against. B1 did NOT restore the
+      tags (classifier flagged it as user-data modification under the
+      "config-only changes" boundary; user hadn't given explicit
+      go-ahead at end of session).
+
+  PENDING (A1 → B1 dependency):
+    - A1: fix WF12 BUG 1 (action-field parser) and BUG 2 (non-destructive
+      tag patch). Self-contained brief was relayed verbatim to A1.
+    - Once A1 confirms both fixes shipped, B1 re-clicks SOC_Quarantine_File
+      on case #49 — expected: tag `response:quarantine_file:dry_run` added
+      NEXT TO existing 12 tags (case has no file_path observable, so it
+      dry-runs); comment shows action correctly mapped to "quarantine_file".
+
+  Notes for next instance on this VM:
+    - sshpass installed (used 1× for SCP from A1).
+    - Live n8n restart cycle: simply restarting n8n is not enough to
+      re-register a workflow; the workflow itself must be toggled Active
+      in the editor (or `UPDATE workflow_entity SET active=1` + restart).
+    - WF11 and WF12 are now both live on A1:
+        /webhook/l1-decision      → WF11 (L1 verdict TP/FP/Escalate_L2)
+        /webhook/response-action  → WF12 (L2/response actions, buggy)
+
+2026-05-27 — incident-mgmt (VM_B1) — Phase 19.2: 3 Cortex Responders installed (L1 TP/FP/Escalate buttons)
   Done (Cortex side complete + verified):
     - Created the 3 responders + JSON defs + requirements.txt under
       ~/soc-project/thehive-cortex/cortex/Cortex-Analyzers/responders/SOC/
