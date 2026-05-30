@@ -764,7 +764,7 @@ phase_13_email_ack_loop:              complete       # added 2026-05-17 (commit 
 phase_14_ml_grounding:                pending        # waiting on encadrent decision re training dataset (A: UNSW-NB15/CIC-IDS2017/NSL-KDD public IDS, B: Atomic Red Team replay on lab, C: LANL Comprehensive Cyber-Security Events). Today's model `source: "synthetic"` — /score returns ~0.62 for both clearly-suspicious and clearly-normal inputs. Adjacent work (no encadrent input needed): expand features 4→8+ (day_of_week, asset_criticality, time_since_last_alert_for_ip, MITRE-tactic histogram); add /classify_tp_fp supervised head trained on TheHive resolved cases.
 phase_15_atomic_red_team:             pending        # independent of Phase 14. Run 3-5 ART tests mapped to existing SOC rules (T1021.004→SOC-012, T1059.004→SOC-006, T1078→SOC-001/002, T1190→SOC-003/004) end-to-end through the pipeline. Log time-to-case, time-to-email, auto_block fire, AI report quality. Strong soutenance demo.
 
-last_updated: 2026-05-28
+last_updated: 2026-05-30
 updated_by: incident-mgmt (VM_B1)
 ```
 
@@ -776,7 +776,56 @@ updated_by: incident-mgmt (VM_B1)
 > Maximum 5 entries kept; older ones archived in `docs/session-history.md`.
 
 ```
-2026-05-28 (latest) — incident-mgmt (VM_B1) — Phase 19.2 click test PASSED + Phase 20: 5 new responders installed; smoke test surfaced 2 WF12 bugs on A1
+2026-05-30 (latest) — incident-mgmt (VM_B1) — Phase 21 follow-up: 4 SOC custom fields registered + live attack-chain test snapshot
+
+  Phase 21 dependency (FB-20) — RESOLVED:
+    - Pulled /tmp/thehive_customfields_schema.sh from A1, ran on B1.
+    - bot key lacks `manageCustomField` permission (org-analyst scope).
+      Fell back to admin@thehive.local Basic auth (THEHIVE_DEFAULT_USER/
+      THEHIVE_DEFAULT_PASSWORD in .env.local) — all 4 POSTs returned 200.
+    - All 4 soc-* custom fields now live in TheHive 5 (verified via
+      GET /api/v1/customField):
+        soc-urgency               float
+        soc-blast-radius          string  options=[single-host,subnet,crown-jewel]
+        soc-kill-chain-stage      string
+        soc-containment-window-min integer
+    - WF9 PATCHes against these will no longer silently degrade.
+
+  Note for next instance (or A1): the schema script defaults to using
+    THEHIVE_BOT_API_KEY but that key cannot create custom fields. Either:
+      (a) grant manageCustomField to the soc-bot profile in the admin org, or
+      (b) document the admin-Basic-auth fallback in the script preamble.
+    I went with (b) in-session (no profile changes).
+
+  Live attack-chain test (2026-05-29, before B1 restart):
+    Real Hydra brute-force from Kali → B2. Pipeline produced:
+      - WF1 case in 1m40s end-to-end (AI summary + 14 tags + 6 obs + MISP push)
+      - WF9 L2 brief (Ollama) in 14m
+      - L2 click → SOC_Autoblock_Isolate → WF12 in 13s
+    Bugs uncovered live, then 3 of them fixed by A1 in Phase 21 (d898b2c):
+      Bug C (WF11/WF10 close-bug)         FIXED in Phase 21
+      Bug A (WF2/WF7 enrichment-comment loop) FIXED in Phase 21 (comment node deleted)
+      WF9 hallucination layer              FIXED in Phase 21 (LLM-as-writer-only)
+    Bugs still outstanding (next instance to triage):
+      Bug D — WF12 doesn't pass --target-ip to response_runner; runner errors
+              "missing target_ip arg". Containment never actually fires.
+      Bug E — SOC-012 KQL source.ip extracts 192.168.1.51 (B1) instead of
+              attacker's 192.168.1.52 (Kali). Probably ZeroTier hop / KQL field.
+      Bug F — Case shows victim hostname=soc-core (A1) instead of victim-lab.
+      Bug G — Phase-18 5-min dedupe window crossed (cases 5m54s apart, didn't
+              dedupe). Window may be too short for SOC-012 latency.
+
+  B1 lab state at session end:
+    - Full clean restart via start-soc.sh (Cassandra → ES → docker stack →
+      MISP, with 3-min settles). All 6 containers up. TheHive :9000 = 200.
+      Cortex :9001 = 200. MISP :8443 = 200. Load avg back from 19 to ~4.
+    - misp-misp-core-1 healthcheck still cosmetically "unhealthy" (1s timeout
+      vs slow PHP boot); the actual HTTP endpoint serves in ~44ms.
+    - The Phase-19 ad-hoc /etc/php/8.4/fpm/conf.d/99-misp-memory.ini override
+      (mem_limit=2G) was REVERTED before the restart — was causing runaway
+      PHP-FPM during high-throughput WF1 hits. MISP back to default 512M.
+
+2026-05-28 — incident-mgmt (VM_B1) — Phase 19.2 click test PASSED + Phase 20: 5 new responders installed; smoke test surfaced 2 WF12 bugs on A1
   Phase 19.2 — closed end-to-end:
     - Click test on SOC_Confirm_TP succeeded on case #49 (~284758136).
       Cortex job xW3DcJ4Bbzehy1sR-F7J = Success (HTTP 200 from WF11, ~3s).
