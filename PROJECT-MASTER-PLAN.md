@@ -654,6 +654,41 @@ WF9 — 09 L2 Escalation NLP
 
 ---
 
+### Phase 21 — TheHive-5 case-quality tweaks + "LLM is a writer, not an analyst" rework (2026-05-30)
+
+**Driver:** a teammate review of a real auto-created case found the AI surfaces were *doing analysis* — and getting it wrong: hallucinated MITRE stage that contradicted the case's own fields, source/target confusion in remediation, a magic "urgency 0.7", fake "cluster of 1" correlation, and fabricated shell commands + wrong ATT&CK mitigation IDs that *looked* vetted. Root cause: a 4B model (gemma3:4b) was deciding severity / MITRE / disposition / actions. Phase 21 makes the **deterministic pipeline** the source of truth for every decision and demotes the LLM to a single grounded sentence that is always optional. Governing rule for all future AI surfaces: **the LLM never decides anything; it only writes, strictly grounded in fed facts, and every surface must be fully functional with the LLM section empty.**
+
+All changes are surgical edits to the live n8n DB (`workflow_entity` + synced `workflow_history`) via one-shot operator scripts under `/tmp/` on VM_A1, plus the email template source. No new workflows.
+
+**T1–T6 — TheHive-5 case-creation tweaks (WF1 `Build disposition` + `TheHive: create case`):**
+- **T1 Title:** `[{rule_id}] {rule_name} — {src} → {dst} (as {user})`, prefers hostname for dst, `(×N)` when the bucket aggregated N alerts.
+- **T2 Severity→status:** confident FP (`recommended_action=auto_close_fp`) → case opens **Closed / FalsePositive / NoImpact**, assignee soc-bot, no human in the loop (new `IF auto-close FP?` → `TheHive: PATCH close (FP)` branch). Confident TP / mid-confidence open as New/Indeterminate.
+- **T3 TLP:** default **AMBER+STRICT** (TLP 2.0 integer 3) on every case.
+- **T4 PAP:** derived — stealth/targeted tactics (TA0011/TA0010/TA0005/TA0003/TA0004) or external-src override → RED(3, passive); confident TP + auto_block → GREEN(1, auto-contain OK); else AMBER(2).
+- **T5 Assignee routing:** FP → soc-bot (automation); TP or override (privileged-account / tier-0 dst / external src) → socadmin (L2); uncertain → soc-bot (L1 queue).
+- **T6 Tags:** full namespacing — `project:pfe`, `env:lab`, `pipeline:v2`, `provenance:auto-created`, `rule:<id>`, `logsource:<rule_source>`, `dedupe:<key>`, `mitre:<tactic>`/`<technique>`, `disposition:<x>`, `assignee:l1|l2`, `tlp:amber-strict`, consolidated `ml:verdict:tp|fp` + `ml:action:<x>` + `ml:model:<x>` + `ml:confidence:<2dp>` + `ml:confidence:<band>`, `override:<reason>` when overridden, `audit:sampled` on near-threshold auto-close FPs. Same `PFE→project:pfe` / `SOC-Lab→env:lab` / `automated→provenance:*` rename applied to WF3/WF4/WF5 case tags. `Build disposition` is now the single source of truth for the tag array. (`first-seen:src-dst-user` deferred — no persistent first-seen store after the engine retirement; logged FB-19.)
+
+**WF11/WF10 close-bug fix:** both verdict workflows computed `resolutionStatus` but never sent `status`/`resolutionStatus` in the PATCH, so cases never actually closed. Added both fields (status="Closed"); `neverError:true` degrades safely.
+
+**Case description rework (new WF1 `Build description` node, between `Build disposition` and `create case`):** deterministic Markdown core — disposition headline, "What happened" (templated), Facts table, deterministic Recommended-action (mapped from disposition, never free-form), Pivots — plus an **optional** grounded "Context" sentence from the LLM. MITRE names are a **lookup from the alert's own `kibana.alert.rule.threat[]` block** (rule-agnostic; "Unmapped" when absent), never generated.
+
+**`anomaly_score` retired:** the legacy IsolationForest field name was mislabeling P(TP). Renamed `anomaly_score→p_tp` and `is_anomaly→is_true_positive` in `Append anomaly score`; fixed the mislabeled "/100" references in `Ollama: tag case`. WF1 is now `anomaly_score`-free.
+
+**L1 alert email rework (template source):** the email is a compiled Jinja template (`alert.html.j2` → `compile_template.py` → `alert.compiled.js` → WF1 `Build email HTML` node — "DO NOT EDIT BY HAND"). Reworked at source: dropped the LLM "AI Analyst Summary" + "Threat Actor Profile" sections, added an optional grounded "Context" block, MITRE row now shows looked-up names, verdict/P(TP)/actions are deterministic (disposition-mapped, no shell commands). Email Ollama prompt → constrained one-sentence `{context}` writer. Email gate (`IF severity high/critical`) replaced with a **needs-human disposition gate** — email (and thus the ack link) only fires for `analyst-review-l1` / `override-escalated-l2` / `tp-escalated-l2`, never for auto-closed FPs.
+
+**Comment 1 — email-ack (WF8):** the ack is an audit event, not an analyst note. Dropped the `Post ack comment` node (the queryable `email-acked:<gmail-user>` tag is the record), removed the 📬 emoji, fixed the success-page wording. Escalated-only is enforced upstream by the new email gate.
+
+**Comment 2 — L2 brief (WF9):** deleted the 3 LLM-as-analyst calls (correlate/summarize/recommend); the LLM now writes only a grounded 2–3 sentence Situation. Everything else deterministic and decomposed into TheHive primitives: **urgency** (derived: severity + P(TP) + override), **blast radius** (tier-0 dst → crown-jewel; >1 host → subnet; else single-host), **kill-chain stage** (tactic-id lookup), **containment window** → emitted **both** as custom fields (`soc-urgency`/`soc-blast-radius`/`soc-kill-chain-stage`/`soc-containment-window-min`) and a comment metrics table; **recommended action** → one L2 Task from the vetted `response_map.yaml` playbook (names the tested script, never a generated command); **ATT&CK mitigations** from a verified M-code lookup; **affected asset** fixed (victim = login target, source labelled separately — remediation no longer points at the wrong host); fake "cluster of 1" replaced with a real related-alert count. WF1→WF9 trigger payload extended with verdict/p_tp/disposition/override/mitre-names/victim so WF9 is deterministic-from-payload.
+
+**Cortex auto-enrichment comment removed (WF2):** dropped the "Auto-enrichment dispatched: N observables sent to Cortex…" comment node and rewired around it.
+
+**Pending validation (B1 + Ollama dependent):**
+1. `sudo systemctl restart n8n` on A1 to load all post-restart entity edits (runtime executes `workflow_entity.nodes`, loaded on restart only).
+2. Define the 4 L2 custom fields in TheHive on B1: run `/tmp/thehive_customfields_schema.sh` (needs `THEHIVE_BOT_API_KEY`). Until then the metrics still render in the brief comment table; only the queryable fields are dormant. Logged FB-20.
+3. Live-test T1–T6 + close fix + description + email + Comments end-to-end once B1 is up and (for the grounded-sentence layer) the Ollama tunnel is restored.
+
+---
+
 ## 10. Integration Map — Service-to-Service Connections
 
 | From | To | Purpose | Protocol |
